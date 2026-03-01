@@ -2,7 +2,6 @@ import json
 import math
 import os
 import random
-import time
 
 import boto3
 from sagemaker.deserializers import JSONDeserializer
@@ -49,18 +48,29 @@ REGION = "eu-north-1" # Stockholm is a good choice for low-latency access from E
 # Minimum required policy: AmazonSageMakerFullAccess
 ROLE_ARN = "arn:aws:iam::148469447057:role/service-role/AmazonSageMaker-ExecutionRole-20260301T082995"
 # Instance type used for BOTH training and endpoint hosting.
-# ml.m5.xlarge is a good general-purpose starting point for small datasets.
+# ml.m5.large is sufficient for 100,000 records of pooled-embedding training —
+# Object2Vec is not compute-heavy; the bottleneck is data I/O, not CPU/RAM.
+# Comparison of common options for this workload:
+#   ml.m5.large   —  2 vCPU,  8 GiB RAM  — cheapest; fits this dataset easily ✓
+#   ml.m5.xlarge  —  4 vCPU, 16 GiB RAM  — 2× cost, unnecessary for 100k records
+#   ml.m5.2xlarge —  8 vCPU, 32 GiB RAM  — 4× cost, only needed for millions of records
 # Switch to "local" to run with SageMaker Local Mode (no cloud cost, Docker required).
-INSTANCE_TYPE = "ml.m5.xlarge"
+INSTANCE_TYPE = "ml.m5.large"
 # Total number of unique users in the dataset (IDs 0 – 9).
 NUM_USERS = 10
 # Total number of unique products in the dataset (IDs 0 – 19).
 NUM_PRODUCTS = 20
+# Number of products attached to each user per training record.
+# Each in1 sequence contains exactly this many product IDs.
+# This value must match enc1_max_seq_len in the hyperparameters below.
+NUM_PRODUCTS_PER_USER = 5
 # Path to the raw JSON Lines data file relative to this script.
+# Each record links one user (in0) to a basket of NUM_PRODUCTS_PER_USER
+# products (in1) with a single averaged affinity label.
 DATA_FILE = "object-2-vec-regression-data.jsonl"
 # Local paths where the 80 % / 20 % splits will be written before upload.
 TRAIN_FILE = "object-2-vec-regression-train.jsonl"
-TEST_FILE  = "object-2-vec-regression-testing.jsonl"
+TEST_FILE = "object-2-vec-regression-testing.json"
 # Fixed random seed — ensures the same 80/20 split every time the script runs,
 # making results reproducible across different machines and runs.
 RANDOM_SEED = 42
@@ -74,7 +84,6 @@ with open(DATA_FILE, "r") as f:
     # Read every non-empty line and parse it as a JSON object.
     records = [json.loads(line) for line in f if line.strip()]
 print(f"  Total records loaded: {len(records)}")
-
 # Shuffle the records so that the train/test split is random rather than
 # ordered by user or product ID, which could introduce sampling bias.
 random.seed(RANDOM_SEED)
@@ -107,10 +116,8 @@ print(f"  Splits written to disk: {TRAIN_FILE}, {TEST_FILE}")
 # Session wraps the boto3 session and is the shared context passed to every
 # SageMaker SDK object (Estimator, Predictor).  upload_data() copies a local
 # file to S3 under the given key prefix and returns the full s3:// URI.
-
 boto3_session = boto3.Session(region_name=REGION)
 sm_session    = Session(boto_session=boto3_session)
-
 print("\nUploading data to S3 ...")
 # upload_data() copies the file to S3 and returns:
 #   s3://<bucket>/<key_prefix>/<filename>
@@ -158,7 +165,6 @@ hyperparameters = {
     # Vocabulary size for encoder 0 — must equal the total number of unique
     # user IDs in the dataset. IDs must be in the range [0, enc0_vocab_size).
     "enc0_vocab_size": NUM_USERS,
-
     # Maximum sequence length for encoder 0.
     # Required by the Object2Vec container when enc0_network is "pooled_embedding"
     # or "bilstm". Each user input is a single integer ID wrapped in a list
@@ -171,9 +177,10 @@ hyperparameters = {
 
     # Maximum sequence length for encoder 1.
     # Required by the Object2Vec container when enc1_network is "pooled_embedding"
-    # or "bilstm". Each product input is a single integer ID wrapped in a list
-    # e.g. [14], so the sequence length is always 1.
-    "enc1_max_seq_len": 1,
+    # or "bilstm". Each product input is now a basket of 5 product IDs e.g.
+    # [0, 3, 7, 11, 15], so the sequence length must be set to 5.
+    # This must equal NUM_PRODUCTS_PER_USER defined in Global configuration.
+    "enc1_max_seq_len": NUM_PRODUCTS_PER_USER,
 
     # Dimensionality of the embedding vector produced by each encoder.
     # Larger values capture more nuance but require more data and compute.
@@ -316,7 +323,10 @@ endpoint_name = "object2vec-regression-endpoint"
 print(f"\nDeploying model to endpoint '{endpoint_name}' (may take 5 – 10 minutes) ...")
 predictor = estimator.deploy(
     initial_instance_count=1,           # One serving instance
-    instance_type=INSTANCE_TYPE,        # Same instance type as training
+    instance_type="ml.t3.medium",       # Cheapest inference instance — 2 vCPU, 4 GiB RAM,
+                                        # sufficient for single-record Object2Vec inference.
+                                        # Separate from INSTANCE_TYPE (ml.m5.large) used for
+                                        # training, which needs more RAM for data loading.
     endpoint_name=endpoint_name,        # Fixed name for easy reference
     serializer=JSONSerializer(),        # Encodes request payload as JSON
     deserializer=JSONDeserializer(),    # Decodes JSON response to Python dict
@@ -376,14 +386,62 @@ for i, record in enumerate(test_records):
         f"Actual: {record['label']:.1f}  |  Predicted: {predicted_score:.4f}"
     )
 
-# --- Compute Root Mean Squared Error (RMSE) ---
-# RMSE measures average prediction error in the same units as the label.
-# Lower is better; RMSE < 0.5 on a 1.0 – 5.0 scale is generally good.
-squared_errors = [(a - p) ** 2 for a, p in zip(actual_labels, predicted_labels)]
-rmse = math.sqrt(sum(squared_errors) / len(squared_errors))
+# ---------------------------------------------------------------------------
+# Model accuracy evaluation
+# ---------------------------------------------------------------------------
+# Four complementary metrics are computed on the 20 % holdout test set:
+#
+#   RMSE (Root Mean Squared Error)
+#     — Average prediction error in the same units as the label (1.0 – 5.0).
+#     — Penalises large errors more heavily than small ones (squared).
+#     — Lower is better. RMSE < 0.5 on a 1–5 scale is generally good.
+#
+#   MAE (Mean Absolute Error)
+#     — Average absolute difference between actual and predicted scores.
+#     — More robust to outliers than RMSE.
+#     — Lower is better.
+#
+#   R² (Coefficient of Determination)
+#     — Proportion of variance in the labels explained by the model.
+#     — Range: (−∞, 1.0]. R² = 1.0 is a perfect fit; R² ≤ 0 means the
+#       model is no better than always predicting the mean label.
+#     — Higher is better.
+#
+#   Tolerance Accuracy (within ± 0.5)
+#     — Percentage of predictions that fall within 0.5 of the actual score.
+#     — Intuitive business metric: "how often is the prediction close enough?"
+#     — Higher is better.
 
-print(f"\n  RMSE on 20 % test set: {rmse:.4f}")
-print("  (RMSE is in the same units as the affinity score, range 1.0 – 5.0)")
+n = len(actual_labels)
+
+# --- RMSE ---
+squared_errors = [(a - p) ** 2 for a, p in zip(actual_labels, predicted_labels)]
+rmse = math.sqrt(sum(squared_errors) / n)
+
+# --- MAE ---
+absolute_errors = [abs(a - p) for a, p in zip(actual_labels, predicted_labels)]
+mae = sum(absolute_errors) / n
+
+# --- R² ---
+mean_actual  = sum(actual_labels) / n
+ss_total     = sum((a - mean_actual) ** 2 for a in actual_labels)   # total variance
+ss_residual  = sum(squared_errors)                                    # unexplained variance
+r_squared    = 1 - (ss_residual / ss_total) if ss_total > 0 else 0.0
+
+# --- Tolerance accuracy (within ± 0.5 of the actual label) ---
+TOLERANCE         = 0.5   # maximum acceptable absolute error
+within_tolerance  = sum(1 for e in absolute_errors if e <= TOLERANCE)
+tolerance_accuracy = (within_tolerance / n) * 100   # expressed as a percentage
+
+print("\n" + "=" * 55)
+print("  Model Accuracy Report — 20 % holdout test set")
+print("=" * 55)
+print(f"  Records evaluated      : {n}")
+print(f"  RMSE                   : {rmse:.4f}  (lower is better)")
+print(f"  MAE                    : {mae:.4f}  (lower is better)")
+print(f"  R²                     : {r_squared:.4f}  (closer to 1.0 is better)")
+print(f"  Tolerance accuracy     : {tolerance_accuracy:.1f} %  (predictions within ±{TOLERANCE})")
+print("=" * 55)
 
 # ---------------------------------------------------------------------------
 # STEP 9 — Clean up: delete the endpoint to stop incurring charges
