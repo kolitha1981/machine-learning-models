@@ -56,7 +56,6 @@ TRAINING_INSTANCE_TYPE = "ml.m5.large"
 # for single-record XGBoost inference requests.
 INFERENCE_INSTANCE_TYPE = "ml.t3.medium"
 
-
 # Local paths for the data files (same directory as this script).
 DATA_FILE  = "xg-boost-regression-data.csv"
 TRAIN_FILE = "xg-boost-regression-data-training.csv"
