@@ -32,7 +32,6 @@ from sagemaker.deserializers import CSVDeserializer
 # ---------------------------------------------------------------------------
 # Global configuration
 # ---------------------------------------------------------------------------
-
 # S3 bucket where all data and model artefacts will be stored.
 # Must already exist in the same region as REGION.
 S3_BUCKET = "xgboost-regression-bucket-12345"
@@ -45,7 +44,7 @@ REGION = "eu-north-1"
 
 # IAM role SageMaker assumes to access S3 and ECR.
 # Minimum required policy: AmazonSageMakerFullAccess
-ROLE_ARN = "arn:aws:iam::123456789012:role/SageMakerExecutionRole"
+ROLE_ARN = "arn:aws:iam::148469447057:role/service-role/AmazonSageMaker-ExecutionRole-20260302T181367"
 
 # EC2 instance type for the training job.
 # ml.m5.large (2 vCPU, 8 GiB RAM) is sufficient for 10,000 rows with 5 features.
@@ -54,7 +53,7 @@ TRAINING_INSTANCE_TYPE = "ml.m5.large"
 # EC2 instance type for the inference endpoint.
 # ml.t3.medium (2 vCPU, 4 GiB RAM) is the smallest available and is enough
 # for single-record XGBoost inference requests.
-INFERENCE_INSTANCE_TYPE = "ml.t3.medium"
+INFERENCE_INSTANCE_TYPE = "ml.m5.large"
 
 # Local paths for the data files (same directory as this script).
 DATA_FILE  = "xg-boost-regression-data.csv"
@@ -410,106 +409,103 @@ print("\nRunning predictions on the test set ...")
 
 actual_labels    = []   # Ground-truth target values from the test split
 predicted_labels = []   # Values predicted by the deployed XGBoost model
+for i, row in enumerate(test_rows):
+    actual_price = row[0]       # First column is the house price label
+    features     = row[1:]      # sqft, bedrooms, bathrooms, house_age
 
+    # predictor.predict() serialises features as "sqft,bedrooms,bathrooms,house_age",
+    # calls invoke_endpoint(), and deserialises the CSV response.
+    result          = predictor.predict(features)
+    predicted_score = float(result[0][0])   # Extract scalar from [["value"]]
+
+    actual_labels.append(actual_price)
+    predicted_labels.append(predicted_score)
+
+    # Print every 500th record and the final record to track progress
+    if i % 500 == 0 or i == len(test_rows) - 1:
+        sqft      = row[1]
+        bedrooms  = int(row[2])
+        bathrooms = row[3]
+        age       = row[4]
+        print(
+            f"  [{i+1:>4}/{len(test_rows)}]  "
+            f"{sqft:>6.0f} sqft  {bedrooms}bd/{bathrooms}ba  {age:>4.0f}yr  |  "
+            f"Actual: ${actual_price:>10,.0f}  |  "
+            f"Predicted: ${predicted_score:>10,.0f}  |  "
+            f"Error: ${abs(actual_price - predicted_score):>8,.0f}"
+        )
+
+# -----------------------------------------------------------------------
+# Accuracy metrics
+# -----------------------------------------------------------------------
+# Four complementary metrics computed on the full 20 % holdout test set:
+#
+#   RMSE (Root Mean Squared Error)
+#     Penalises large errors more than small ones due to squaring.
+#     For house prices, RMSE < $20,000 is considered good.
+#     Lower is better.
+#
+#   MAE (Mean Absolute Error)
+#     Average absolute dollar difference between actual and predicted price.
+#     More robust to outlier sales than RMSE. Lower is better.
+#
+#   R² (Coefficient of Determination)
+#     Fraction of price variance explained by the 4 features.
+#     1.0 = perfect fit. Reference: Ames Housing R² ~ 0.85–0.92.
+#     Higher is better.
+#
+#   Tolerance Accuracy (within ± $20,000 of actual price)
+#     % of predictions within $20,000 of the actual sale price.
+#     $20,000 is ~8 % of the median $250,000 price — a realistic threshold.
+#     Higher is better.
+
+n = len(actual_labels)
+
+# RMSE — root mean squared error
+squared_errors  = [(a - p) ** 2 for a, p in zip(actual_labels, predicted_labels)]
+rmse            = math.sqrt(sum(squared_errors) / n)
+
+# MAE — mean absolute error
+absolute_errors = [abs(a - p) for a, p in zip(actual_labels, predicted_labels)]
+mae             = sum(absolute_errors) / n
+
+# R² — coefficient of determination
+mean_actual = sum(actual_labels) / n
+ss_total    = sum((a - mean_actual) ** 2 for a in actual_labels)   # total variance
+ss_residual = sum(squared_errors)                                    # unexplained variance
+r_squared   = 1.0 - (ss_residual / ss_total) if ss_total > 0 else 0.0
+
+# Tolerance accuracy — % predictions within ± $20,000 of actual price
+TOLERANCE          = 20000.0    # $20,000 — ~8 % of median house price
+within_tolerance   = sum(1 for e in absolute_errors if e <= TOLERANCE)
+tolerance_accuracy = (within_tolerance / n) * 100
+
+print("\n" + "=" * 58)
+print("  Model Accuracy Report — 20 % holdout test set")
+print("=" * 58)
+print(f"  Records evaluated      : {n}")
+print(f"  RMSE                   : ${rmse:>12,.2f}  (lower is better)")
+print(f"  MAE                    : ${mae:>12,.2f}  (lower is better)")
+print(f"  R²                     : {r_squared:>13.4f}  (closer to 1.0 is better)")
+print(f"  Tolerance accuracy     : {tolerance_accuracy:>12.1f} %  (predictions within ±${TOLERANCE:,.0f})")
+print("=" * 58)
+
+# -----------------------------------------------------------------------
+# STEP 9 — Delete the endpoint to stop incurring charges
+# -----------------------------------------------------------------------
+# Using finally guarantees cleanup even if prediction raises an exception,
+# preventing orphaned endpoints that accrue hourly instance charges.
+#
+# predictor.delete_endpoint(delete_endpoint_config=True) removes:
+#   • the live endpoint              (stops billing immediately)
+#   • the endpoint configuration
+#   • the registered model object
+print("\nCleaning up AWS resources ...")
 try:
-    for i, row in enumerate(test_rows):
-        actual_price = row[0]       # First column is the house price label
-        features     = row[1:]      # sqft, bedrooms, bathrooms, house_age
-
-        # predictor.predict() serialises features as "sqft,bedrooms,bathrooms,house_age",
-        # calls invoke_endpoint(), and deserialises the CSV response.
-        result          = predictor.predict(features)
-        predicted_score = float(result[0][0])   # Extract scalar from [["value"]]
-
-        actual_labels.append(actual_price)
-        predicted_labels.append(predicted_score)
-
-        # Print every 500th record and the final record to track progress
-        if i % 500 == 0 or i == len(test_rows) - 1:
-            sqft      = row[1]
-            bedrooms  = int(row[2])
-            bathrooms = row[3]
-            age       = row[4]
-            print(
-                f"  [{i+1:>4}/{len(test_rows)}]  "
-                f"{sqft:>6.0f} sqft  {bedrooms}bd/{bathrooms}ba  {age:>4.0f}yr  |  "
-                f"Actual: ${actual_price:>10,.0f}  |  "
-                f"Predicted: ${predicted_score:>10,.0f}  |  "
-                f"Error: ${abs(actual_price - predicted_score):>8,.0f}"
-            )
-
-    # -----------------------------------------------------------------------
-    # Accuracy metrics
-    # -----------------------------------------------------------------------
-    # Four complementary metrics computed on the full 20 % holdout test set:
-    #
-    #   RMSE (Root Mean Squared Error)
-    #     Penalises large errors more than small ones due to squaring.
-    #     For house prices, RMSE < $20,000 is considered good.
-    #     Lower is better.
-    #
-    #   MAE (Mean Absolute Error)
-    #     Average absolute dollar difference between actual and predicted price.
-    #     More robust to outlier sales than RMSE. Lower is better.
-    #
-    #   R² (Coefficient of Determination)
-    #     Fraction of price variance explained by the 4 features.
-    #     1.0 = perfect fit. Reference: Ames Housing R² ~ 0.85–0.92.
-    #     Higher is better.
-    #
-    #   Tolerance Accuracy (within ± $20,000 of actual price)
-    #     % of predictions within $20,000 of the actual sale price.
-    #     $20,000 is ~8 % of the median $250,000 price — a realistic threshold.
-    #     Higher is better.
-
-    n = len(actual_labels)
-
-    # RMSE — root mean squared error
-    squared_errors  = [(a - p) ** 2 for a, p in zip(actual_labels, predicted_labels)]
-    rmse            = math.sqrt(sum(squared_errors) / n)
-
-    # MAE — mean absolute error
-    absolute_errors = [abs(a - p) for a, p in zip(actual_labels, predicted_labels)]
-    mae             = sum(absolute_errors) / n
-
-    # R² — coefficient of determination
-    mean_actual = sum(actual_labels) / n
-    ss_total    = sum((a - mean_actual) ** 2 for a in actual_labels)   # total variance
-    ss_residual = sum(squared_errors)                                    # unexplained variance
-    r_squared   = 1.0 - (ss_residual / ss_total) if ss_total > 0 else 0.0
-
-    # Tolerance accuracy — % predictions within ± $20,000 of actual price
-    TOLERANCE          = 20000.0    # $20,000 — ~8 % of median house price
-    within_tolerance   = sum(1 for e in absolute_errors if e <= TOLERANCE)
-    tolerance_accuracy = (within_tolerance / n) * 100
-
-    print("\n" + "=" * 58)
-    print("  Model Accuracy Report — 20 % holdout test set")
-    print("=" * 58)
-    print(f"  Records evaluated      : {n}")
-    print(f"  RMSE                   : ${rmse:>12,.2f}  (lower is better)")
-    print(f"  MAE                    : ${mae:>12,.2f}  (lower is better)")
-    print(f"  R²                     : {r_squared:>13.4f}  (closer to 1.0 is better)")
-    print(f"  Tolerance accuracy     : {tolerance_accuracy:>12.1f} %  (predictions within ±${TOLERANCE:,.0f})")
-    print("=" * 58)
-
-finally:
-    # -----------------------------------------------------------------------
-    # STEP 9 — Delete the endpoint to stop incurring charges
-    # -----------------------------------------------------------------------
-    # Using finally guarantees cleanup even if prediction raises an exception,
-    # preventing orphaned endpoints that accrue hourly instance charges.
-    #
-    # predictor.delete_endpoint(delete_endpoint_config=True) removes:
-    #   • the live endpoint              (stops billing immediately)
-    #   • the endpoint configuration
-    #   • the registered model object
-    print("\nCleaning up AWS resources ...")
-    try:
-        predictor.delete_endpoint(delete_endpoint_config=True)
-        print(f"  Deleted endpoint: {endpoint_name}")
-    except Exception as exc:
-        print(f"  Warning — could not delete endpoint: {exc}")
+    predictor.delete_endpoint(delete_endpoint_config=True)
+    print(f"  Deleted endpoint: {endpoint_name}")
+except Exception as exc:
+    print(f"  Warning — could not delete endpoint: {exc}")
 
 print("\nDone.")
 
