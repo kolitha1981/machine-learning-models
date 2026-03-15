@@ -514,33 +514,31 @@ s3_val_uri = sm_session.upload_data(
 )
 print(f"    → {s3_val_uri}")
 
-# The Seq2Seq container looks for the vocab file INSIDE the train channel
-# directory — it must be uploaded to the same S3 prefix as the train .rec
-# file, NOT as a separate named channel.  The container expects the file to
-# be named "vocab.src.json" and "vocab.trg.json" (source and target vocabs).
-# Since we use the same discretisation for both source and target we upload
-# the same vocab file twice under both expected names.
+# The Seq2Seq container expects vocab.src.json and vocab.trg.json to be
+# present in a dedicated S3 prefix (input/vocab/) which is passed to the
+# training job as a separate "vocab" named channel in estimator.fit().
+# The container mounts that channel at /opt/ml/input/data/vocab/ and reads
+# the two files from there.  Since source and target use the same
+# discretisation, we upload the single vocab file twice under both names.
 #
-# IMPORTANT: Upload directly with the correct filenames using boto3
-# upload_file() rather than uploading then copying in S3.  The copy_object
-# approach can fail silently, causing the container to report:
-#   ClientError: Vocab files are not present in the input directory
-print("  Uploading vocab files into the train channel prefix ...")
+# We use boto3 upload_file() directly so the S3 keys have the exact names
+# the container expects — no intermediate rename/copy step required.
+print("  Uploading vocab files into the vocab channel prefix (input/vocab/) ...")
 s3_client = boto3.client("s3", region_name=REGION)
 
 s3_client.upload_file(
     Filename=VOCAB_FILE,
     Bucket=S3_BUCKET,
-    Key=f"{S3_PREFIX}/input/train/vocab.src.json",
+    Key=f"{S3_PREFIX}/input/vocab/vocab.src.json",
 )
-print(f"    → s3://{S3_BUCKET}/{S3_PREFIX}/input/train/vocab.src.json")
+print(f"    → s3://{S3_BUCKET}/{S3_PREFIX}/input/vocab/vocab.src.json")
 
 s3_client.upload_file(
     Filename=VOCAB_FILE,
     Bucket=S3_BUCKET,
-    Key=f"{S3_PREFIX}/input/train/vocab.trg.json",
+    Key=f"{S3_PREFIX}/input/vocab/vocab.trg.json",
 )
-print(f"    → s3://{S3_BUCKET}/{S3_PREFIX}/input/train/vocab.trg.json")
+print(f"    → s3://{S3_BUCKET}/{S3_PREFIX}/input/vocab/vocab.trg.json")
 
 
 # ---------------------------------------------------------------------------
@@ -693,26 +691,35 @@ estimator = Estimator(
 
 
 # ---------------------------------------------------------------------------
-# STEP 5 — Define the two training data channels and launch the job
+# STEP 5 — Define the three training data channels and launch the job
 # ---------------------------------------------------------------------------
-# The Seq2Seq container reads from two S3 channels:
+# The Seq2Seq container reads from three S3 channels:
 #
 #   "train"
 #       content_type = "application/x-recordio-protobuf"
 #       Binary RecordIO file with 80,000 (source[30], target[5]) windows.
-#       The container also looks in THIS prefix for vocab.src.json and
-#       vocab.trg.json — they MUST be in the same prefix as the .rec file,
-#       NOT in a separate channel.  Separate vocab channel causes:
-#         ClientError: Vocab files are not present in the input directory
+#       Mounted inside the container at /opt/ml/input/data/train/.
 #
 #   "validation"
 #       content_type = "application/x-recordio-protobuf"
 #       20,000 held-out windows.  The container evaluates BLEU score on this
 #       channel at the end of each epoch and prints it to CloudWatch logs.
+#       Mounted at /opt/ml/input/data/validation/.
+#
+#   "vocab"
+#       content_type = "application/json"
+#       Contains vocab.src.json and vocab.trg.json in a dedicated S3 prefix
+#       (input/vocab/).  Providing this as a named channel means the vocab
+#       files are mounted at /opt/ml/input/data/vocab/ and the container
+#       picks them up from there — keeping them cleanly separate from the
+#       binary .rec training files.
+#       NOTE: YES — the vocab channel MUST be passed to fit(); without it
+#       the container cannot locate the vocab files and will raise:
+#         ClientError: Vocab files are not present in the input directory
 # ---------------------------------------------------------------------------
 print("\n" + "=" * 70)
 print("STEP 5 — Launching Seq2Seq training job")
-print("         (this may take 20–40 minutes on ml.p2.xlarge GPU)")
+print("         (this may take 20–40 minutes on ml.g5.2xlarge GPU)")
 print("=" * 70)
 
 train_input = TrainingInput(
@@ -725,17 +732,25 @@ validation_input = TrainingInput(
     content_type="application/x-recordio-protobuf",
 )
 
+# Dedicated vocab channel — points to the input/vocab/ prefix where
+# vocab.src.json and vocab.trg.json were uploaded in STEP 2.
+vocab_input = TrainingInput(
+    s3_data=f"s3://{S3_BUCKET}/{S3_PREFIX}/input/vocab",
+    content_type="application/json",
+)
+
 print("  Data channels:")
 print(f"    train      → s3://{S3_BUCKET}/{S3_PREFIX}/input/train")
 print(f"    validation → {s3_val_uri}")
-print(f"    vocab      → s3://{S3_BUCKET}/{S3_PREFIX}/input/train/vocab.src.json (in train prefix)")
+print(f"    vocab      → s3://{S3_BUCKET}/{S3_PREFIX}/input/vocab")
 print("\n  Starting training job ...")
 print("  Monitor progress in the SageMaker console or CloudWatch Logs.\n")
 
 estimator.fit(
     inputs={
-        "train": train_input,
+        "train":      train_input,
         "validation": validation_input,
+        "vocab":      vocab_input,   # required — container reads vocab.src/trg.json from this channel
     },
     wait=True,    # Block until the job reaches Completed or Failed
     logs=True,    # Stream CloudWatch training logs to the console
