@@ -117,6 +117,10 @@ TRAIN_RATIO = 0.80       # 80% of windows → training set (80,000), remaining 2
 TRAIN_FILE = "seq-to-seq-train.rec"
 VAL_FILE = "seq-to-seq-val.rec"
 VOCAB_FILE = "seq-to-seq-vocab.json"
+# Sidecar file that stores price_min and bin_width so the inference decoder
+# (STEP 7) can convert token IDs back to dollar prices when existing files
+# are reused.  NOT uploaded to S3 — local use only.
+META_FILE  = "seq-to-seq-meta.json"
 
 # ===========================================================================
 # DATA GENERATION FUNCTIONS
@@ -238,15 +242,42 @@ def build_discretiser(all_prices: list) -> tuple:
         bin_index = int((price - price_min) / bin_width)
         bin_index = min(bin_index, NUM_BINS - 1)   # clamp for price_max edge
         return bin_index + BIN_OFFSET
-    # Vocabulary: token_id (str) → midpoint dollar value.
-    # Only price-bin tokens (IDs BIN_OFFSET … BIN_OFFSET+NUM_BINS-1) are included.
-    # PAD (0) and EOS (1) are intentionally excluded — the container adds them
-    # internally, and their string labels ("<pad>", "<eos>") cannot be parsed as
-    # floats, which causes the container to raise:
-    #   ValueError: cannot convert float NaN to integer
-    vocab = {}
+
+    # -----------------------------------------------------------------------
+    # Vocabulary: word_string → integer_token_id
+    #
+    # CONFIRMED ROOT CAUSE (from training logs + vocab file analysis):
+    #
+    #   The old vocab had float price midpoints as values:
+    #     {"2": 58.4857, ..., "1001": 917.412}
+    #
+    #   The container converts each value:  int(float("58.4857")) = 58
+    #   Building id_to_word = {58: "2", ..., 917: "1001"}
+    #
+    #   Result: token IDs 2-57 and 918-1001 had NO entry in id_to_word:
+    #     • IDs  2- 57 → discarded as unknown → "Found empty sentence"
+    #     • IDs 918-1001 → out of bounds for 1000-entry embedding → NaN
+    #
+    # CORRECT FORMAT: values MUST equal the integer token IDs themselves.
+    #   {"<pad>": 0, "<eos>": 1, "2": 2, "3": 3, ..., "1001": 1001}
+    #
+    #   id_to_word = {0: "<pad>", 1: "<eos>", 2: "2", ..., 1001: "1001"}
+    #   → every token ID 0-1001 is covered, no tokens discarded.
+    #   → 1002 entries → vocab_size auto-detected as 1002 by container.
+    #   → embedding matrix covers 0-1001 → no out-of-bounds → no NaN.
+    # -----------------------------------------------------------------------
+    vocab = {
+        "<pad>": PAD_ID,    # 0  integer value — safe: int(float(0)) = 0
+        "<eos>": EOS_ID,    # 1  integer value — safe: int(float(1)) = 1
+    }
     for i in range(NUM_BINS):
-        vocab[str(i + BIN_OFFSET)] = round(price_min + (i + 0.5) * bin_width, 4)
+        token_id = i + BIN_OFFSET       # 2 … 1001
+        vocab[str(token_id)] = token_id # value = integer token ID itself
+
+    # Write META_FILE so the files_exist reuse branch (and STEP 7 inference
+    # decoder) can reconstruct prices from token IDs without the vocab file.
+    with open(META_FILE, "w") as _mf:
+        json.dump({"price_min": price_min, "bin_width": bin_width}, _mf, indent=2)
 
     return price_to_token, vocab, price_min, bin_width
 
@@ -493,8 +524,9 @@ print("STEP 1 — Preparing RecordIO data files")
 print("=" * 70)
 files_exist = (
     os.path.exists(TRAIN_FILE) and
-    os.path.exists(VAL_FILE) and
-    os.path.exists(VOCAB_FILE)
+    os.path.exists(VAL_FILE)   and
+    os.path.exists(VOCAB_FILE) and
+    os.path.exists(META_FILE)       # stores price_min + bin_width for decoding
 )
 
 # ---------------------------------------------------------------------------
@@ -530,7 +562,7 @@ if files_exist:
     except Exception as e:
         print(f"\n  !! Existing .rec files are invalid or incompatible: {e}")
         print(f"  !! Deleting and regenerating from scratch ...\n")
-        for bad_file in (TRAIN_FILE, VAL_FILE, VOCAB_FILE):
+        for bad_file in (TRAIN_FILE, VAL_FILE, VOCAB_FILE, META_FILE):
             if os.path.exists(bad_file):
                 os.remove(bad_file)
         files_exist = False
@@ -541,40 +573,16 @@ if files_exist:
     print(f"    {TRAIN_FILE}  ({os.path.getsize(TRAIN_FILE) / 1024 / 1024:.1f} MB)")
     print(f"    {VAL_FILE}    ({os.path.getsize(VAL_FILE) / 1024 / 1024:.1f} MB)")
     print(f"    {VOCAB_FILE}")
+    print(f"    {META_FILE}")
 
-    # Lazily reconstruct price_min and bin_width from the vocab file.
-    target_keys = {str(BIN_OFFSET), str(BIN_OFFSET + 1)}
-    lazy_vals = {}
-    with open(VOCAB_FILE, "r") as f:
-        buf = ""
-        decoder = json.JSONDecoder()
-        for chunk in iter(lambda: f.read(256), ""):
-            buf += chunk
-            while True:
-                buf = buf.lstrip(" \t\n\r{,")
-                if not buf or buf.startswith("}"):
-                    break
-                try:
-                    key, idx = decoder.raw_decode(buf)
-                    rest = buf[idx:].lstrip(" \t\n\r")
-                    if not rest.startswith(":"):
-                        break
-                    rest = rest[1:].lstrip(" \t\n\r")
-                    val, vidx = decoder.raw_decode(rest)
-                    buf = rest[vidx:]
-                    if key in target_keys:
-                        lazy_vals[key] = float(val)
-                    if len(lazy_vals) == len(target_keys):
-                        break
-                except json.JSONDecodeError:
-                    break
-            if len(lazy_vals) == len(target_keys):
-                break
-
-    mid_0 = lazy_vals[str(BIN_OFFSET)]
-    mid_1 = lazy_vals[str(BIN_OFFSET + 1)]
-    bin_width = mid_1 - mid_0
-    price_min = mid_0 - 0.5 * bin_width
+    # Read price_min and bin_width from the dedicated metadata sidecar file.
+    # The vocab now uses integer token IDs as values (not float midpoints),
+    # so we no longer reconstruct discretisation bounds from the vocab.
+    with open(META_FILE, "r") as _mf:
+        _meta = json.load(_mf)
+    price_min = _meta["price_min"]
+    bin_width  = _meta["bin_width"]
+    print(f"  Price metadata  : price_min=${price_min:.4f}  bin_width=${bin_width:.4f}")
 
     # Read the first frame from the validation file for the sample record.
     with open(VAL_FILE, "rb") as f:
@@ -816,6 +824,13 @@ print("STEP 4 — Configuring Seq2Seq Estimator and hyperparameters")
 print("=" * 70)
 
 hyperparameters = {
+    # ── Vocabulary ────────────────────────────────────────────────────────
+    # vocab_size MUST be set explicitly.  Without it, the container infers
+    # vocab_size from max(token_id)+1 across the RecordIO file, which can
+    # produce a value smaller than VOCAB_SIZE and cause out-of-bounds
+    # embedding look-ups → NaN loss from the very first batch.
+    "vocab_size": VOCAB_SIZE,               # 1002 = 1000 bins + PAD + EOS
+
     # ── Sequence lengths (must match data generator) ──────────────────────
     "max_seq_len_source": SOURCE_LEN,       # 30 — encoder input length
     "max_seq_len_target": TARGET_LEN,       # 5  — decoder output length

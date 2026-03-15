@@ -143,10 +143,12 @@ WINDOWS_PER_TICKER    = TARGET_RECORDS // len(TICKERS)           # 20,000
 RUNS_PER_TICKER       = -(-WINDOWS_PER_TICKER // WINDOWS_PER_RUN)  # ceil div → 28
 
 # Output file paths (same directory as this script).
-SCRIPT_DIR  = os.path.dirname(os.path.abspath(__file__))
-TRAIN_FILE  = os.path.join(SCRIPT_DIR, "seq-to-seq-train.rec")
-VAL_FILE    = os.path.join(SCRIPT_DIR, "seq-to-seq-val.rec")
-VOCAB_FILE  = os.path.join(SCRIPT_DIR, "seq-to-seq-vocab.json")
+TRAIN_FILE  = "seq-to-seq-train.rec"
+VAL_FILE    = "seq-to-seq-val.rec"
+VOCAB_FILE  = "seq-to-seq-vocab.json"
+# Sidecar metadata file: stores price_min and bin_width so seq-to-seq.py can
+# decode token IDs back to prices without parsing the vocab file.
+META_FILE   = "seq-to-seq-meta.json"
 
 # Reproducible random seed.
 RANDOM_SEED = 42
@@ -323,20 +325,34 @@ def price_to_token(price: float) -> int:
 
 
 # Build and write the vocabulary mapping:
-#   token_id (str) → midpoint dollar price (float, 4 d.p.)
+#   word_string → integer_token_id
 #
-# PAD (0) and EOS (1) are intentionally excluded.  The SageMaker Seq2Seq
-# container tries to parse every vocab value as a float; string values like
-# "<pad>" and "<eos>" cannot be parsed as floats, causing the container to
-# silently produce NaN and then raise:
-#   ValueError: cannot convert float NaN to integer
-# The container manages PAD/EOS internally — the vocab file only needs
-# entries for the actual price-bin tokens (IDs BIN_OFFSET … BIN_OFFSET+NUM_BINS-1).
-vocab = {}
+# CONFIRMED ROOT CAUSE OF THE PREVIOUS BUG (training logs analysis):
+#
+#   Old format  {"2": 58.4857, ..., "1001": 917.412}  (float midpoints)
+#   Container parsed each value as: int(float("58.4857")) = 58
+#   Built id_to_word = {58: "2", ..., 917: "1001"}
+#   Token IDs 2-57 and 918-1001 had NO id_to_word entry:
+#     • IDs  2- 57  → discarded as unknown → "Found empty sentence"
+#     • IDs 918-1001 → embedding out-of-bounds → NaN loss
+#
+# CORRECT FORMAT: values = integer token IDs themselves.
+#   {"<pad>": 0, "<eos>": 1, "2": 2, "3": 3, ..., "1001": 1001}
+#   id_to_word = {0:"<pad>", 1:"<eos>", 2:"2", ..., 1001:"1001"}
+#   → all IDs 0-1001 covered, 1002 entries, vocab_size = 1002 ✓
+vocab = {
+    "<pad>": PAD_ID,   # 0 — integer → int(float(0)) = 0  ✓
+    "<eos>": EOS_ID,   # 1 — integer → int(float(1)) = 1  ✓
+}
 for i in range(NUM_BINS):
-    token_id     = i + BIN_OFFSET
-    midpoint_usd = price_min + (i + 0.5) * bin_width
-    vocab[str(token_id)] = round(midpoint_usd, 4)
+    token_id = i + BIN_OFFSET      # 2 … 1001
+    vocab[str(token_id)] = token_id   # value = integer token ID
+
+# Write META_FILE with the discretisation parameters so seq-to-seq.py can
+# decode predictions back to USD prices without re-parsing the vocab file.
+with open(META_FILE, "w") as _mf:
+    json.dump({"price_min": price_min, "bin_width": bin_width}, _mf, indent=2)
+print(f"  Metadata sidecar written → {META_FILE}")
 
 
 with open(VOCAB_FILE, "w") as f:
