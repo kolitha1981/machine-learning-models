@@ -44,7 +44,7 @@ except ImportError:
         "Install the required packages with:\n"
         "    pip install sagemaker protobuf\n"
     )
-
+#============================================================================
 # ---------------------------------------------------------------------------
 # Global configuration
 # ---------------------------------------------------------------------------
@@ -238,8 +238,13 @@ def build_discretiser(all_prices: list) -> tuple:
         bin_index = int((price - price_min) / bin_width)
         bin_index = min(bin_index, NUM_BINS - 1)   # clamp for price_max edge
         return bin_index + BIN_OFFSET
-    # Vocabulary: token_id (str) → midpoint dollar value
-    vocab = {str(PAD_ID): "<pad>", str(EOS_ID): "<eos>"}
+    # Vocabulary: token_id (str) → midpoint dollar value.
+    # Only price-bin tokens (IDs BIN_OFFSET … BIN_OFFSET+NUM_BINS-1) are included.
+    # PAD (0) and EOS (1) are intentionally excluded — the container adds them
+    # internally, and their string labels ("<pad>", "<eos>") cannot be parsed as
+    # floats, which causes the container to raise:
+    #   ValueError: cannot convert float NaN to integer
+    vocab = {}
     for i in range(NUM_BINS):
         vocab[str(i + BIN_OFFSET)] = round(price_min + (i + 0.5) * bin_width, 4)
 
@@ -509,7 +514,8 @@ if files_exist:
             if magic != RECORDIO_MAGIC:
                 raise ValueError(
                     f"Bad RecordIO magic: {magic:#010x} (expected {RECORDIO_MAGIC:#010x}). "
-                    f"File may have been written with big-endian byte order."
+                    f"File may ha"
+                    f"e been written with big-endian byte order."
                 )
             payload = f.read(length)
             if len(payload) < length:
@@ -857,7 +863,6 @@ estimator = Estimator(
     hyperparameters=hyperparameters,
     sagemaker_session=sm_session,
 )
-
 
 # ---------------------------------------------------------------------------
 # STEP 5 — Define the three training data channels and launch the job

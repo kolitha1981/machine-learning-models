@@ -324,15 +324,20 @@ def price_to_token(price: float) -> int:
 
 # Build and write the vocabulary mapping:
 #   token_id (str) → midpoint dollar price (float, 4 d.p.)
+#
+# PAD (0) and EOS (1) are intentionally excluded.  The SageMaker Seq2Seq
+# container tries to parse every vocab value as a float; string values like
+# "<pad>" and "<eos>" cannot be parsed as floats, causing the container to
+# silently produce NaN and then raise:
+#   ValueError: cannot convert float NaN to integer
+# The container manages PAD/EOS internally — the vocab file only needs
+# entries for the actual price-bin tokens (IDs BIN_OFFSET … BIN_OFFSET+NUM_BINS-1).
 vocab = {}
 for i in range(NUM_BINS):
     token_id     = i + BIN_OFFSET
     midpoint_usd = price_min + (i + 0.5) * bin_width
     vocab[str(token_id)] = round(midpoint_usd, 4)
 
-# Also document the two special tokens in the vocab file for completeness.
-vocab["0"] = "<pad>"
-vocab["1"] = "<eos>"
 
 with open(VOCAB_FILE, "w") as f:
     json.dump(vocab, f, indent=2)
