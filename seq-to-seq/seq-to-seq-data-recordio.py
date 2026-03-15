@@ -40,9 +40,10 @@ import struct
 #  Layer 3 │ Protobuf blob  ──► RecordIO binary frame
 #           │   Every serialised protobuf is prefixed with a fixed 8-byte
 #           │   RecordIO header using Python's struct module:
-#           │     Bytes 0-3  : magic number  0xCED7230A  (big-endian uint32)
-#           │     Bytes 4-7  : payload length in bytes   (big-endian uint32)
+#           │     Bytes 0-3  : magic number  0xCED7230A  (little-endian uint32)
+#           │     Bytes 4-7  : payload length in bytes   (little-endian uint32)
 #           │     Bytes 8-N  : raw serialised protobuf bytes
+#           │     Bytes N+1… : zero-padding to align next frame to 4-byte boundary
 #           │   All frames are concatenated into a single binary .rec file.
 # ─────────────────────────────────────────────────────────────────────────
 #
@@ -421,20 +422,21 @@ def build_record(source_ids: list, target_ids: list) -> bytes:
 #   SageMaker adopted it as the standard binary data format for its built-in
 #   algorithms (Seq2Seq, KNN, Linear Learner, etc.).
 #
-# Frame layout (8-byte header + payload):
-#   ┌─────────────────────────────────────────────────────────┐
-#   │ Bytes 0–3  │ Magic number : 0xCED7230A  (uint32, BE)   │
-#   │ Bytes 4–7  │ Payload len  : len(proto_bytes) (uint32, BE)│
-#   │ Bytes 8–N  │ Payload      : raw protobuf bytes          │
-#   └─────────────────────────────────────────────────────────┘
-#   BE = big-endian byte order (network byte order).
+# Frame layout (8-byte header + payload + padding):
+#   ┌────────────────────────────────────────────────────────────┐
+#   │ Bytes 0–3   │ Magic number : 0xCED7230A  (uint32, LE)     │
+#   │ Bytes 4–7   │ Payload len  : len(proto_bytes) (uint32, LE)│
+#   │ Bytes 8–N   │ Payload      : raw protobuf bytes           │
+#   │ Bytes N+1–? │ Zero-padding to align next frame to 4 bytes │
+#   └────────────────────────────────────────────────────────────┘
+#   LE = little-endian byte order (MXNet / SageMaker spec).
 #
 # Why struct.pack?
 #   Python's struct module packs Python integers into fixed-width binary
-#   representations.  ">II" means:
-#     >  = big-endian byte order
+#   representations.  "<II" means:
+#     <  = little-endian byte order  (REQUIRED by MXNet RecordIO spec)
 #     I  = unsigned 32-bit integer (4 bytes) — the magic number
-#     I  = unsigned 32-bit integer (4 bytes) — the payload length
+#     I  = unsigned 32-bit integer (4 bytes) — the raw payload length
 #
 # All frames are written sequentially into a single .rec binary file.
 # The Seq2Seq container reads the file start-to-end, using each magic-number
@@ -462,19 +464,26 @@ def write_recordio_file(path: str, records: list) -> int:
         for i, (source_ids, target_ids) in enumerate(records):
             # Layer 2 — convert token IDs to a serialised protobuf blob.
             proto_bytes = build_record(source_ids, target_ids)
+            length = len(proto_bytes)
 
             # Layer 3 — build the 8-byte RecordIO header.
-            #   struct.pack(">II", magic, length):
-            #     ">"  = big-endian
+            #   struct.pack("<II", magic, length):
+            #     "<"  = little-endian  (MXNet / SageMaker RecordIO spec)
             #     "I"  = unsigned 32-bit int
             #   First  I = RECORDIO_MAGIC  (0xCED7230A) — frame start marker
-            #   Second I = len(proto_bytes) — how many bytes follow the header
-            header = struct.pack(">II", RECORDIO_MAGIC, len(proto_bytes))
+            #   Second I = len(proto_bytes) — raw (unpadded) payload length
+            header = struct.pack("<II", RECORDIO_MAGIC, length)
 
             # Write header immediately followed by the protobuf payload.
             f.write(header)
             f.write(proto_bytes)
-            total_bytes += len(header) + len(proto_bytes)
+
+            # Pad to 4-byte boundary so the next frame starts aligned.
+            pad_len = (4 - length % 4) % 4
+            if pad_len:
+                f.write(b"\x00" * pad_len)
+
+            total_bytes += 8 + length + pad_len
 
             # Progress indicator every 10,000 records.
             if (i + 1) % 10_000 == 0:
@@ -508,13 +517,20 @@ print(f"  Validation → {VAL_FILE}  ({val_mb:.1f} MB)")
 
 print(f"\nVerifying first record from {TRAIN_FILE} ...")
 with open(TRAIN_FILE, "rb") as f:
-    # Read and unpack the 8-byte header.
+    # Read and unpack the 8-byte header — LITTLE-ENDIAN.
     header_bytes = f.read(8)
-    magic, length = struct.unpack(">II", header_bytes)
+    magic, length = struct.unpack("<II", header_bytes)
     assert magic == RECORDIO_MAGIC, f"Bad magic: {magic:#010x}"
 
     # Read exactly `length` payload bytes and deserialise.
-    payload  = f.read(length)
+    payload = f.read(length)
+    assert len(payload) == length, f"Truncated payload: got {len(payload)}, expected {length}"
+
+    # Skip 4-byte boundary padding before the next frame.
+    pad_len = (4 - length % 4) % 4
+    if pad_len:
+        f.read(pad_len)
+
     verified = Record()
     verified.ParseFromString(payload)
 

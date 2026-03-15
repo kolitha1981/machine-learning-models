@@ -277,11 +277,12 @@ def write_recordio_file(path: str, token_records: list) -> int:
       Layer 2 : build_proto_record()  → raw protobuf bytes
       Layer 3 : 8-byte RecordIO header (magic + length) prepended to each blob
 
-    RecordIO frame layout
+    RecordIO frame layout (MXNet / SageMaker spec — LITTLE-ENDIAN)
     ─────────────────────
-      Bytes 0–3 : 0xCED7230A  magic number   (big-endian uint32)
-      Bytes 4–7 : payload length in bytes     (big-endian uint32)
+      Bytes 0–3 : 0xCED7230A  magic number   (little-endian uint32)
+      Bytes 4–7 : raw payload length in bytes (little-endian uint32)
       Bytes 8–N : serialised protobuf payload
+      Bytes N+1…: zero-padding to align the NEXT frame to a 4-byte boundary
 
     Parameters
     ----------
@@ -296,10 +297,16 @@ def write_recordio_file(path: str, token_records: list) -> int:
     with open(path, "wb") as f:
         for i, (source_ids, target_ids) in enumerate(token_records):
             proto_bytes = build_proto_record(source_ids, target_ids)
-            header = struct.pack(">II", RECORDIO_MAGIC, len(proto_bytes))
+            length = len(proto_bytes)
+            # Header: magic + raw payload length — LITTLE-ENDIAN (MXNet spec)
+            header = struct.pack("<II", RECORDIO_MAGIC, length)
             f.write(header)
             f.write(proto_bytes)
-            total_bytes += len(header) + len(proto_bytes)
+            # Pad to 4-byte boundary so the next frame starts aligned
+            pad_len = (4 - length % 4) % 4
+            if pad_len:
+                f.write(b"\x00" * pad_len)
+            total_bytes += 8 + length + pad_len
             if (i + 1) % 10_000 == 0:
                 print(f"      Written {i + 1:>7,} / {len(token_records):,} frames ...")
     return total_bytes
@@ -343,78 +350,98 @@ print(f"  source_len     : {SOURCE_LEN} days  |  target_len : {TARGET_LEN} days"
 print("\n" + "=" * 70)
 print("STEP 1 — Preparing RecordIO data files")
 print("=" * 70)
-files_exist = (TRAIN_FILE and VAL_FILE and VOCAB_FILE)
+files_exist = (
+    os.path.exists(TRAIN_FILE) and
+    os.path.exists(VAL_FILE) and
+    os.path.exists(VOCAB_FILE)
+)
+
+# ---------------------------------------------------------------------------
+# Pre-validation: if the files are on disk, quickly confirm the first frame
+# is readable with the correct little-endian magic and valid protobuf bytes.
+# This runs BEFORE the if/else so that files_exist can be set to False here
+# and the else branch below handles both "files absent" and "files corrupt"
+# without needing a second condition.
+# ---------------------------------------------------------------------------
+if files_exist:
+    try:
+        with open(VAL_FILE, "rb") as f:
+            hdr = f.read(8)
+            if len(hdr) < 8:
+                raise ValueError("VAL_FILE too short to contain a RecordIO header")
+            magic, length = struct.unpack("<II", hdr)
+            if magic != RECORDIO_MAGIC:
+                raise ValueError(
+                    f"Bad RecordIO magic: {magic:#010x} (expected {RECORDIO_MAGIC:#010x}). "
+                    f"File may have been written with big-endian byte order."
+                )
+            payload = f.read(length)
+            if len(payload) < length:
+                raise ValueError(f"Truncated payload: got {len(payload)} bytes, expected {length}")
+            pad_len = (4 - length % 4) % 4
+            if pad_len:
+                f.read(pad_len)
+        probe = Record()
+        probe.ParseFromString(payload)
+        if not probe.features["source_ids"].int32_tensor.values:
+            raise ValueError("First record has an empty source sequence — file may be corrupt")
+    except Exception as e:
+        print(f"\n  !! Existing .rec files are invalid or incompatible: {e}")
+        print(f"  !! Deleting and regenerating from scratch ...\n")
+        for bad_file in (TRAIN_FILE, VAL_FILE, VOCAB_FILE):
+            if os.path.exists(bad_file):
+                os.remove(bad_file)
+        files_exist = False
 
 if files_exist:
+    # ---- Reuse existing files -------------------------------------------
     print(f"  Existing files found — reusing:")
     print(f"    {TRAIN_FILE}  ({os.path.getsize(TRAIN_FILE) / 1024 / 1024:.1f} MB)")
     print(f"    {VAL_FILE}    ({os.path.getsize(VAL_FILE) / 1024 / 1024:.1f} MB)")
     print(f"    {VOCAB_FILE}")
+
     # Lazily reconstruct price_min and bin_width from the vocab file.
-    #
-    # We only need two midpoint values (the first two price-bin entries) to
-    # fully recover the discretisation parameters — there is no need to load
-    # all VOCAB_SIZE entries into memory.
-    #
-    # The vocab JSON is streamed token-by-token using json.JSONDecoder so
-    # that only the characters read so far are held in memory.  As soon as
-    # both target keys are found the loop exits, leaving the rest of the file
-    # unread.  For a 1,002-entry vocab this saves little, but the same code
-    # scales to millions of bins without loading the full file.
-    #
-    # Key layout in vocab:
-    #   "0"             → "<pad>"
-    #   "1"             → "<eos>"
-    #   str(BIN_OFFSET) → midpoint of bin 0   ← we need this (mid_0)
-    #   str(BIN_OFFSET+1)→ midpoint of bin 1  ← and this    (mid_1)
-    #   ...             → remaining bins       ← ignored
-    #
-    # bin_width = mid_1 - mid_0
-    # price_min = mid_0 - 0.5 * bin_width
     target_keys = {str(BIN_OFFSET), str(BIN_OFFSET + 1)}
     lazy_vals = {}
     with open(VOCAB_FILE, "r") as f:
         buf = ""
         decoder = json.JSONDecoder()
-        # Read the file in small chunks; parse key-value pairs on the fly.
         for chunk in iter(lambda: f.read(256), ""):
             buf += chunk
-            # Scan buf for complete "key": value pairs by attempting partial
-            # JSON parses after each "{" or "," boundary.
             while True:
                 buf = buf.lstrip(" \t\n\r{,")
                 if not buf or buf.startswith("}"):
                     break
                 try:
-                    # Try to decode the next key string.
                     key, idx = decoder.raw_decode(buf)
                     rest = buf[idx:].lstrip(" \t\n\r")
                     if not rest.startswith(":"):
-                        break           # need more data
+                        break
                     rest = rest[1:].lstrip(" \t\n\r")
                     val, vidx = decoder.raw_decode(rest)
                     buf = rest[vidx:]
                     if key in target_keys:
                         lazy_vals[key] = float(val)
                     if len(lazy_vals) == len(target_keys):
-                        break           # both values found — stop reading
+                        break
                 except json.JSONDecodeError:
-                    break               # incomplete chunk — read more
+                    break
             if len(lazy_vals) == len(target_keys):
-                break                   # exit the file-reading loop early
+                break
 
     mid_0 = lazy_vals[str(BIN_OFFSET)]
     mid_1 = lazy_vals[str(BIN_OFFSET + 1)]
     bin_width = mid_1 - mid_0
     price_min = mid_0 - 0.5 * bin_width
 
-    # We also need a small held-out sample for the post-deployment prediction
-    # step.  Read the first frame from the validation file to get one example.
+    # Read the first frame from the validation file for the sample record.
     with open(VAL_FILE, "rb") as f:
         hdr = f.read(8)
-        magic, length = struct.unpack(">II", hdr)
-        assert magic == RECORDIO_MAGIC
+        magic, length = struct.unpack("<II", hdr)
         payload = f.read(length)
+        pad_len = (4 - length % 4) % 4
+        if pad_len:
+            f.read(pad_len)
 
     sample_record = Record()
     sample_record.ParseFromString(payload)
@@ -425,46 +452,39 @@ if files_exist:
     print(f"  Sample target IDs          : {sample_target_ids}")
 
 else:
-    # --- Regenerate data files -------------------------------------------
+    # ---- Regenerate data files ------------------------------------------
     print("  .rec files not found — regenerating from GBM simulation ...")
     print(f"  Ticker       : {TICKER}  (start=${START_PRICE:.2f}  drift={DRIFT:.0%}  vol={VOLATILITY:.0%})")
     print(f"  Days/run     : {TRADING_DAYS_PER_RUN}  (≈ 3 years)")
     print(f"  Runs needed  : {RUNS_NEEDED}")
     print(f"  Target total : {TARGET_RECORDS:,} records")
 
-    # Layer 1a — simulate prices and extract sliding windows.
     print("\n  Simulating GBM prices ...")
     raw_records, all_prices = generate_raw_records(RANDOM_SEED)
     print(f"\n  Total windows generated : {len(raw_records):,}")
 
-    # Layer 1b — build discretiser from global price range.
     price_to_token, vocab, price_min, bin_width = build_discretiser(all_prices)
     print(f"  Price range : ${min(all_prices):.4f} – ${max(all_prices):.4f}")
     print(f"  Bin width   : ${bin_width:.4f}")
 
-    # Write vocabulary file.
     with open(VOCAB_FILE, "w") as f:
         json.dump(vocab, f, indent=2)
     print(f"  Vocabulary written → {VOCAB_FILE}")
 
-    # Convert float records to token-ID records.
     token_records = [
         ([price_to_token(p) for p in src], [price_to_token(p) for p in tgt])
         for src, tgt in raw_records
     ]
 
-    # Shuffle and split 80 / 20.
     random.Random(RANDOM_SEED).shuffle(token_records)
     split = int(len(token_records) * TRAIN_RATIO)
     train_recs = token_records[:split]
-    val_recs = token_records[split:]
+    val_recs   = token_records[split:]
     print(f"  Train : {len(train_recs):,}  |  Val : {len(val_recs):,}")
 
-    # Save a sample for the inference step.
     sample_source_ids = val_recs[0][0]
     sample_target_ids = val_recs[0][1]
 
-    # Layers 2 & 3 — serialise to RecordIO protobuf .rec files.
     print(f"\n  Writing {TRAIN_FILE} ...")
     t_bytes = write_recordio_file(TRAIN_FILE, train_recs)
     print(f"    → {t_bytes / 1024 / 1024:.1f} MB")
@@ -822,12 +842,16 @@ with open(VAL_FILE, "rb") as f:
         hdr = f.read(8)
         if len(hdr) < 8:
             break
-        magic, length = struct.unpack(">II", hdr)
+        magic, length = struct.unpack("<II", hdr)
         if magic != RECORDIO_MAGIC:
             break
         payload = f.read(length)
         if len(payload) < length:
             break
+        # Skip 4-byte boundary padding
+        pad_len = (4 - length % 4) % 4
+        if pad_len:
+            f.read(pad_len)
         rec = Record()
         rec.ParseFromString(payload)
         val_source_list.append(list(rec.features["source_ids"].int32_tensor.values))
