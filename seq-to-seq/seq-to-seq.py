@@ -829,7 +829,7 @@ hyperparameters = {
     # vocab_size from max(token_id)+1 across the RecordIO file, which can
     # produce a value smaller than VOCAB_SIZE and cause out-of-bounds
     # embedding look-ups → NaN loss from the very first batch.
-    "vocab_size": VOCAB_SIZE,               # 1002 = 1000 bins + PAD + EOS
+    #"vocab_size": VOCAB_SIZE,               # 1002 = 1000 bins + PAD + EOS
 
     # ── Sequence lengths (must match data generator) ──────────────────────
     "max_seq_len_source": SOURCE_LEN,       # 30 — encoder input length
