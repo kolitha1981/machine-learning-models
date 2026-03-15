@@ -97,6 +97,9 @@ BIN_OFFSET = 2    # First price-bin token ID
 VOCAB_SIZE = NUM_BINS + BIN_OFFSET   # 1002
 # RecordIO frame magic number (fixed by MXNet/SageMaker spec).
 RECORDIO_MAGIC = 0xCED7230A
+# Valid token ID range — used by validate_recordio_file() for range checks.
+TOKEN_MIN = BIN_OFFSET                  # 2    — first price-bin token
+TOKEN_MAX = BIN_OFFSET + NUM_BINS - 1   # 1001 — last  price-bin token
 # ---------------------------------------------------------------------------
 # Single company configuration — Apple Inc. (AAPL)
 # ---------------------------------------------------------------------------
@@ -324,6 +327,139 @@ def token_to_price_factory(price_min: float, bin_width: float):
     return token_to_price
 
 
+# ---------------------------------------------------------------------------
+# RecordIO format validator
+# ---------------------------------------------------------------------------
+# Mirrors the validate_recordio_file() in seq-to-seq-data-recordio.py.
+# Called after regenerating files (else block) to confirm the output is
+# correct before uploading to S3.
+# ---------------------------------------------------------------------------
+
+def validate_recordio_file(path: str, expected_records: int, label: str) -> bool:
+    """
+    Scan every RecordIO frame in *path* and run 8 format checks.
+
+    Checks
+    ------
+    1. Magic number == 0xCED7230A  (little-endian)
+    2. Payload length > 0
+    3. Payload not truncated  (len(payload) == length)
+    4. Payload parses as a valid protobuf Record
+    5. source_ids length == SOURCE_LEN  (30)
+    6. target_ids length == TARGET_LEN  (5)
+    7. All token IDs within [TOKEN_MIN, TOKEN_MAX]  ([2, 1001])
+    8. Total frame count == expected_records
+
+    Returns
+    -------
+    True if all checks pass, False otherwise.
+    """
+    print(f"\n  Validating {label} file : {path}")
+    errors   = []
+    warnings = []
+    frame_idx = 0
+
+    file_size = os.path.getsize(path)
+    print(f"    File size        : {file_size / 1024 / 1024:.2f} MB  ({file_size:,} bytes)")
+
+    with open(path, "rb") as f:
+        while True:
+            hdr = f.read(8)
+            if len(hdr) == 0:
+                break                           # clean EOF
+            if len(hdr) < 8:
+                errors.append(f"Frame {frame_idx}: incomplete header — only {len(hdr)} bytes before EOF")
+                break
+
+            magic, length = struct.unpack("<II", hdr)
+
+            # Check 1 — magic number
+            if magic != RECORDIO_MAGIC:
+                errors.append(
+                    f"Frame {frame_idx}: bad magic {magic:#010x} "
+                    f"(expected {RECORDIO_MAGIC:#010x}) — "
+                    f"file may have been written with big-endian byte order"
+                )
+                break
+
+            # Check 2 — non-zero length
+            if length == 0:
+                errors.append(f"Frame {frame_idx}: payload length is 0")
+                break
+
+            payload = f.read(length)
+
+            # Check 3 — no truncation
+            if len(payload) < length:
+                errors.append(
+                    f"Frame {frame_idx}: truncated payload — "
+                    f"got {len(payload)} bytes, expected {length}"
+                )
+                break
+
+            pad_len = (4 - length % 4) % 4
+            if pad_len:
+                f.read(pad_len)
+
+            # Check 4 — protobuf parseable
+            try:
+                rec = Record()
+                rec.ParseFromString(payload)
+            except Exception as exc:
+                errors.append(f"Frame {frame_idx}: protobuf ParseFromString failed — {exc}")
+                frame_idx += 1
+                continue
+
+            src_ids = list(rec.features["source_ids"].int32_tensor.values)
+            tgt_ids = list(rec.features["target_ids"].int32_tensor.values)
+
+            # Check 5 — source sequence length
+            if len(src_ids) != SOURCE_LEN:
+                errors.append(f"Frame {frame_idx}: source_ids length {len(src_ids)} ≠ {SOURCE_LEN}")
+
+            # Check 6 — target sequence length
+            if len(tgt_ids) != TARGET_LEN:
+                errors.append(f"Frame {frame_idx}: target_ids length {len(tgt_ids)} ≠ {TARGET_LEN}")
+
+            # Check 7 — token ID range
+            bad_src = [t for t in src_ids if not (TOKEN_MIN <= t <= TOKEN_MAX)]
+            bad_tgt = [t for t in tgt_ids if not (TOKEN_MIN <= t <= TOKEN_MAX)]
+            if bad_src:
+                errors.append(
+                    f"Frame {frame_idx}: source token(s) out of range "
+                    f"[{TOKEN_MIN},{TOKEN_MAX}]: {bad_src[:5]}"
+                )
+            if bad_tgt:
+                errors.append(
+                    f"Frame {frame_idx}: target token(s) out of range "
+                    f"[{TOKEN_MIN},{TOKEN_MAX}]: {bad_tgt[:5]}"
+                )
+
+            frame_idx += 1
+
+            if len(errors) >= 10:
+                warnings.append("Stopped after 10 errors — fix and re-run to see more.")
+                break
+
+    # Check 8 — total frame count
+    if frame_idx != expected_records:
+        errors.append(
+            f"Frame count mismatch: found {frame_idx:,}, expected {expected_records:,}"
+        )
+
+    print(f"    Frames scanned   : {frame_idx:,}")
+    if errors:
+        print(f"    Status           : ✗ FAILED ({len(errors)} error(s))")
+        for err in errors:
+            print(f"      ✗ {err}")
+        for wrn in warnings:
+            print(f"      ⚠ {wrn}")
+        return False
+
+    print(f"    Status           : ✓ ALL CHECKS PASSED")
+    return True
+
+
 # ===========================================================================
 # MAIN SCRIPT — SageMaker Seq2Seq training and inference
 # ===========================================================================
@@ -492,6 +628,19 @@ else:
     print(f"\n  Writing {VAL_FILE} ...")
     v_bytes = write_recordio_file(VAL_FILE, val_recs)
     print(f"    → {v_bytes / 1024 / 1024:.1f} MB")
+
+    # ---- Validate the freshly generated files before uploading to S3 ----
+    print(f"\n{'=' * 70}")
+    print(f"  Format Validation — newly generated files")
+    print(f"{'=' * 70}")
+    train_ok = validate_recordio_file(TRAIN_FILE, len(train_recs), "train")
+    val_ok   = validate_recordio_file(VAL_FILE,   len(val_recs),   "validation")
+    if not (train_ok and val_ok):
+        raise RuntimeError(
+            "Generated .rec files failed format validation — "
+            "do NOT upload to S3. Check errors above."
+        )
+    print(f"\n  Validation : ✓ PASSED — files are safe to upload to S3")
 
 print(f"\n  Data files ready.")
 

@@ -510,48 +510,171 @@ print(f"  Validation → {VAL_FILE}  ({val_mb:.1f} MB)")
 
 
 # ---------------------------------------------------------------------------
-# STEP 8 — Verify a sample record (read back and decode)
+# STEP 8 — Full format validation of both generated .rec files
 # ---------------------------------------------------------------------------
-# Read the first frame from the training .rec file and reconstruct the
-# protobuf Record to confirm the data round-trips correctly.
+# Scans EVERY frame in both files and checks:
+#   ✔ Magic number matches 0xCED7230A (little-endian)
+#   ✔ Payload length field is non-zero and consistent with file size
+#   ✔ Payload bytes parse as a valid protobuf Record
+#   ✔ source_ids length == SOURCE_LEN (30)
+#   ✔ target_ids length == TARGET_LEN (5)
+#   ✔ All token IDs are within [BIN_OFFSET, BIN_OFFSET + NUM_BINS - 1]
+#   ✔ Total frame count matches expected record count
+#   ✔ File ends cleanly (no trailing garbage bytes)
 
-print(f"\nVerifying first record from {TRAIN_FILE} ...")
-with open(TRAIN_FILE, "rb") as f:
-    # Read and unpack the 8-byte header — LITTLE-ENDIAN.
-    header_bytes = f.read(8)
-    magic, length = struct.unpack("<II", header_bytes)
-    assert magic == RECORDIO_MAGIC, f"Bad magic: {magic:#010x}"
+TOKEN_MIN = BIN_OFFSET                  # 2
+TOKEN_MAX = BIN_OFFSET + NUM_BINS - 1   # 1001
 
-    # Read exactly `length` payload bytes and deserialise.
-    payload = f.read(length)
-    assert len(payload) == length, f"Truncated payload: got {len(payload)}, expected {length}"
 
-    # Skip 4-byte boundary padding before the next frame.
-    pad_len = (4 - length % 4) % 4
-    if pad_len:
-        f.read(pad_len)
+def validate_recordio_file(path: str, expected_records: int, label: str) -> bool:
+    """
+    Validate every RecordIO frame in *path*.
 
-    verified = Record()
-    verified.ParseFromString(payload)
+    Parameters
+    ----------
+    path             : Path to the .rec file to validate.
+    expected_records : Number of frames expected in the file.
+    label            : Human-readable label for print output ("train" / "val").
 
-source_ids_back = list(verified.features["source_ids"].int32_tensor.values)
-target_ids_back = list(verified.features["target_ids"].int32_tensor.values)
+    Returns
+    -------
+    True if all checks pass, False if any check fails.
+    """
+    print(f"\n  Validating {label} file : {path}")
+    errors   = []
+    warnings = []
+    frame_idx = 0
 
-# Decode token IDs back to midpoint dollar prices using the vocab.
-def token_to_price(token_id: int) -> float:
-    """Decode a token ID back to its midpoint dollar price."""
-    bin_index = token_id - BIN_OFFSET
-    return round(price_min + (bin_index + 0.5) * bin_width, 4)
+    file_size = os.path.getsize(path)
+    print(f"    File size        : {file_size / 1024 / 1024:.2f} MB  ({file_size:,} bytes)")
 
-source_prices_back = [token_to_price(tid) for tid in source_ids_back]
-target_prices_back = [token_to_price(tid) for tid in target_ids_back]
+    with open(path, "rb") as f:
+        while True:
+            # ── Header ──────────────────────────────────────────────────
+            hdr = f.read(8)
+            if len(hdr) == 0:
+                break                       # clean EOF
+            if len(hdr) < 8:
+                errors.append(f"Frame {frame_idx}: incomplete header — only {len(hdr)} bytes before EOF")
+                break
 
-print(f"  Magic number     : {magic:#010x}  ✓")
-print(f"  Payload length   : {length} bytes")
-print(f"  Source IDs (30)  : {source_ids_back[:5]} … {source_ids_back[-5:]}")
-print(f"  Target IDs  (5)  : {target_ids_back}")
-print(f"  Source prices ($): {[f'{p:.2f}' for p in source_prices_back[:5]]} …")
-print(f"  Target prices ($): {[f'{p:.2f}' for p in target_prices_back]}")
+            magic, length = struct.unpack("<II", hdr)
+
+            # Check 1 — magic number
+            if magic != RECORDIO_MAGIC:
+                errors.append(
+                    f"Frame {frame_idx}: bad magic {magic:#010x} "
+                    f"(expected {RECORDIO_MAGIC:#010x}) — "
+                    f"file may have been written with big-endian byte order"
+                )
+                break   # cannot continue; frame boundaries are now unknown
+
+            # Check 2 — non-zero length
+            if length == 0:
+                errors.append(f"Frame {frame_idx}: payload length is 0")
+                break
+
+            # ── Payload ─────────────────────────────────────────────────
+            payload = f.read(length)
+            if len(payload) < length:
+                errors.append(
+                    f"Frame {frame_idx}: truncated payload — "
+                    f"got {len(payload)} bytes, expected {length}"
+                )
+                break
+
+            # Skip 4-byte boundary padding
+            pad_len = (4 - length % 4) % 4
+            if pad_len:
+                f.read(pad_len)
+
+            # Check 3 — protobuf parse
+            try:
+                rec = Record()
+                rec.ParseFromString(payload)
+            except Exception as exc:
+                errors.append(f"Frame {frame_idx}: protobuf ParseFromString failed — {exc}")
+                frame_idx += 1
+                continue
+
+            src_ids = list(rec.features["source_ids"].int32_tensor.values)
+            tgt_ids = list(rec.features["target_ids"].int32_tensor.values)
+
+            # Check 4 — source length
+            if len(src_ids) != SOURCE_LEN:
+                errors.append(
+                    f"Frame {frame_idx}: source_ids length {len(src_ids)} ≠ {SOURCE_LEN}"
+                )
+
+            # Check 5 — target length
+            if len(tgt_ids) != TARGET_LEN:
+                errors.append(
+                    f"Frame {frame_idx}: target_ids length {len(tgt_ids)} ≠ {TARGET_LEN}"
+                )
+
+            # Check 6 — token ID range
+            bad_src = [t for t in src_ids if not (TOKEN_MIN <= t <= TOKEN_MAX)]
+            bad_tgt = [t for t in tgt_ids if not (TOKEN_MIN <= t <= TOKEN_MAX)]
+            if bad_src:
+                errors.append(
+                    f"Frame {frame_idx}: source token(s) out of range "
+                    f"[{TOKEN_MIN},{TOKEN_MAX}]: {bad_src[:5]}"
+                )
+            if bad_tgt:
+                errors.append(
+                    f"Frame {frame_idx}: target token(s) out of range "
+                    f"[{TOKEN_MIN},{TOKEN_MAX}]: {bad_tgt[:5]}"
+                )
+
+            frame_idx += 1
+
+            # Print first record as a sample
+            if frame_idx == 1:
+                def _tid_to_price(tid):
+                    return round(price_min + (tid - BIN_OFFSET + 0.5) * bin_width, 2)
+                print(f"    Sample record 1  :")
+                print(f"      source_ids  (first 5) : {src_ids[:5]} …")
+                print(f"      target_ids            : {tgt_ids}")
+                print(f"      source prices (first 5): "
+                      f"{[_tid_to_price(t) for t in src_ids[:5]]} …")
+                print(f"      target prices         : "
+                      f"{[_tid_to_price(t) for t in tgt_ids]}")
+
+            # Stop collecting errors after 10 to avoid flooding output
+            if len(errors) >= 10:
+                warnings.append("Stopped after 10 errors — fix and re-run to see more.")
+                break
+
+    # ── Frame count ─────────────────────────────────────────────────────────
+    if frame_idx != expected_records:
+        errors.append(
+            f"Frame count mismatch: found {frame_idx:,}, expected {expected_records:,}"
+        )
+
+    # ── Report ──────────────────────────────────────────────────────────────
+    print(f"    Frames scanned   : {frame_idx:,}")
+    if errors:
+        print(f"    Status           : ✗ FAILED ({len(errors)} error(s))")
+        for err in errors:
+            print(f"      ✗ {err}")
+        for wrn in warnings:
+            print(f"      ⚠ {wrn}")
+        return False
+    else:
+        print(f"    Status           : ✓ ALL CHECKS PASSED")
+        return True
+
+
+# Run validation on both files
+print(f"\n{'=' * 65}")
+print(f"  STEP 8 — Format Validation")
+print(f"{'=' * 65}")
+
+train_ok = validate_recordio_file(TRAIN_FILE, len(train_records), "train")
+val_ok   = validate_recordio_file(VAL_FILE,   len(val_records),   "validation")
+
+all_ok = train_ok and val_ok
+print(f"\n  Overall validation : {'✓ PASSED' if all_ok else '✗ FAILED — do NOT upload to S3'}")
 
 
 # ---------------------------------------------------------------------------
@@ -572,13 +695,15 @@ print(f"  Price bins            : {NUM_BINS}")
 print(f"  Training file         : {train_mb:.1f} MB  →  {TRAIN_FILE}")
 print(f"  Validation file       : {val_mb:.1f} MB  →  {VAL_FILE}")
 print(f"  Vocabulary file       :          →  {VOCAB_FILE}")
-print(f"\n  !! IMPORTANT — seq-to-seq.py hyperparameter reminder !!")
-print(f"  Set  {vocab_size_reminder}")
-print(f"  Set  max_seq_len_source = {SOURCE_LEN}")
-print(f"  Set  max_seq_len_target = {TARGET_LEN}")
-print(f"\n  Upload channels to S3:")
-print(f"    train      → {TRAIN_FILE}")
-print(f"    validation → {VAL_FILE}")
-print(f"    vocab      → {VOCAB_FILE}")
+print(f"  Validation result     : {'✓ PASSED — safe to upload to S3' if all_ok else '✗ FAILED — fix errors before uploading'}")
+if all_ok:
+    print(f"\n  !! IMPORTANT — seq-to-seq.py hyperparameter reminder !!")
+    print(f"  Set  {vocab_size_reminder}")
+    print(f"  Set  max_seq_len_source = {SOURCE_LEN}")
+    print(f"  Set  max_seq_len_target = {TARGET_LEN}")
+    print(f"\n  Upload channels to S3:")
+    print(f"    train      → {TRAIN_FILE}")
+    print(f"    validation → {VAL_FILE}")
+    print(f"    vocab      → {VOCAB_FILE}")
 print(f"{'=' * 65}\n")
 
