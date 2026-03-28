@@ -662,9 +662,17 @@ RAW_CORPUS = [
 ]
 
 # 80 / 20 train–validation split.
-split_idx   = int(len(RAW_CORPUS) * 0.80)
-TRAIN_PAIRS = RAW_CORPUS[:split_idx]   # 400 pairs
-VAL_PAIRS   = RAW_CORPUS[split_idx:]   # 100 pairs
+split_idx = int(len(RAW_CORPUS) * 0.80)
+# Avoid landing on a round-number boundary (e.g. exactly 400).
+# The SageMaker Seq2Seq container uses 0-indexed record counting; when the
+# file contains exactly N records it attempts to read record #N, gets EOF,
+# and reports a phantom "empty sentence" which propagates NaN into the
+# mean target/source length ratio and causes a fatal type-conversion error.
+if split_idx % 100 == 0:
+    split_idx -= 1                     # use 399 instead of 400
+
+TRAIN_PAIRS = RAW_CORPUS[:split_idx]   # 399 pairs
+VAL_PAIRS   = RAW_CORPUS[split_idx:]   # 101 pairs
 
 print("=" * 70)
 print("  seq-to-seq-translation-en-de.py")
@@ -969,10 +977,24 @@ def write_recordio_file(path: str, pairs: list) -> int:
     Total bytes written to the file.
     """
     total_bytes = 0
+    skipped = 0
     with open(path, "wb") as f:
         for en_toks, de_toks in pairs:
+            # ── Guard 1: skip pairs where tokenisation returned nothing ────
+            if not en_toks or not de_toks:
+                skipped += 1
+                continue
+
             src_ids = encode_source(en_toks, src_vocab, MAX_SEQ_LEN_SOURCE)
             tgt_ids = encode_target(de_toks, trg_vocab, MAX_SEQ_LEN_TARGET)
+
+            # ── Guard 2: skip all-padding source sequences ────────────────
+            # An all-PAD source (source_len = 0) produces target/source = NaN,
+            # which the container cannot convert to an integer and raises a
+            # fatal "Customer Error: cannot convert float NaN to integer".
+            if all(i == PAD_ID for i in src_ids):
+                skipped += 1
+                continue
 
             proto_bytes = build_proto_record(src_ids, tgt_ids)
             length      = len(proto_bytes)
@@ -988,6 +1010,8 @@ def write_recordio_file(path: str, pairs: list) -> int:
 
             total_bytes += 8 + length + pad_len
 
+    if skipped:
+        print(f"  WARNING: Skipped {skipped} empty / all-padding sentence pair(s)")
     return total_bytes
 
 
@@ -1213,7 +1237,12 @@ hyperparameters = {
 
     # Evaluation and early stopping.
     "optimized_metric":                 "bleu",   # perplexity | accuracy | bleu
-    "checkpoint_frequency_num_batches": 1000,     # evaluate every 1000 batches
+    # With ~399 training records and default batch_size ≈ 64 there are only
+    # ~6 batches/epoch × 10 epochs ≈ 60 total batches.  Setting this to 1000
+    # means a checkpoint is never reached, early-stopping never fires, and
+    # internal statistics relying on checkpointing can get stuck.  Use a
+    # value smaller than the total expected batch count.
+    "checkpoint_frequency_num_batches": 10,       # evaluate every ~2 epochs
     "checkpoint_threshold":             3,        # stop if no improvement for 3 checkpoints
 }
 
