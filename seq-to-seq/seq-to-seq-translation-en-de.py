@@ -39,13 +39,13 @@ Each record encodes one sentence pair:
     English  "the cat sat on the mat"
              → tokenise → [3, 12, 87, 9, 3, 63]
              → pad to max_seq_len_source (e.g. 50)
-             stored in  record.features["source_ids"].int32_tensor
+             stored in  record.features["source"].int32_tensor
 
     German   "die Katze saß auf der Matte"
              → tokenise → [7, 18, 243, 14, 22, 115]
              → append <eos> (ID 1) → [7, 18, 243, 14, 22, 115, 1]
              → pad to max_seq_len_target (e.g. 50)
-             stored in  record.features["target_ids"].int32_tensor
+             stored in  record.features["target"].int32_tensor
 """
 
 import collections
@@ -76,7 +76,7 @@ except ImportError:
 # GLOBAL CONFIGURATION
 # ===========================================================================
 
-S3_BUCKET = "seq2seq-translation--148469447057-us-east-2-an"
+S3_BUCKET = "seq2seq-translation"
 S3_PREFIX = "seq2seq-en-de"
 REGION    = "us-east-2"
 ROLE_ARN  = "arn:aws:iam::148469447057:role/service-role/AmazonSageMaker-ExecutionRole-20260328T104911"
@@ -838,74 +838,80 @@ print(f"""
 # ===========================================================================
 # STEP 3 — ENCODE SENTENCES AS TOKEN ID SEQUENCES
 # ===========================================================================
-# Each sentence is converted from a list of word strings to a fixed-length
-# list of integer token IDs.
+# Each sentence is converted from a list of word strings to a variable-length
+# list of integer token IDs.  NO padding is added here — the SageMaker
+# Seq2Seq container uses MXNet bucketing (bucketing_enabled=True) to group
+# sequences of similar length and adds its own padding at training time.
+# Pre-padding every sequence to max_len causes the container to see only
+# zeros and report every record as "empty sentence".
 #
 # Source encoding (English)
 #   1. Look up each word in src_vocab; use UNK_ID for unknown words.
 #   2. Truncate to MAX_SEQ_LEN_SOURCE if longer.
-#   3. Right-pad with PAD_ID (0) to reach exactly MAX_SEQ_LEN_SOURCE.
 #   Note: the encoder does not need an explicit <eos> — the container adds it.
 #
 # Target encoding (German)
 #   1. Look up each word in trg_vocab; use UNK_ID for unknown words.
-#   2. Append EOS_ID (1) to mark the end of the sentence.
-#   3. Truncate to MAX_SEQ_LEN_TARGET (the <eos> counts toward the limit).
-#   4. Right-pad with PAD_ID (0) to reach exactly MAX_SEQ_LEN_TARGET.
+#   2. Truncate to MAX_SEQ_LEN_TARGET - 1 if longer.
+#   3. Append EOS_ID (1) to mark the end of the sentence.
 # ===========================================================================
 
 def encode_source(tokens: list, vocab: dict, max_len: int) -> list:
     """
-    Convert source (English) tokens to a right-padded integer ID sequence.
+    Convert source (English) tokens to an integer ID sequence, truncated to
+    max_len.  NO padding is added.
+
+    The SageMaker Seq2Seq container uses MXNet bucketing to group variable-
+    length sequences at runtime.  Pre-padding every sequence to max_len causes
+    the container to strip the trailing zeros and end up with only the padding
+    as "real" content, which it reports as an empty sentence.  Storing only
+    the actual token IDs avoids this.
 
     Parameters
     ----------
     tokens  : Word token list from tokenise().
     vocab   : English vocabulary dict {word: token_id}.
-    max_len : Output sequence length (MAX_SEQ_LEN_SOURCE).
+    max_len : Hard truncation limit (MAX_SEQ_LEN_SOURCE).
 
     Returns
     -------
-    List of exactly max_len integers.
+    List of up to max_len integers (no trailing zeros).
 
     Example
     -------
     tokens = ['the', 'cat', 'sat', 'on', 'the', 'mat']
-    → IDs    : [3, 12, 87, 9, 3, 63]
-    → padded to 50: [3, 12, 87, 9, 3, 63, 0, 0, ..., 0]
+    → IDs  : [3, 12, 87, 9, 3, 63]   (6 elements, no padding)
     """
-    ids = [vocab.get(tok, UNK_ID) for tok in tokens]
-    ids = ids[:max_len]
-    ids += [PAD_ID] * (max_len - len(ids))
-    return ids
+    return [vocab.get(tok, UNK_ID) for tok in tokens[:max_len]]
 
 
 def encode_target(tokens: list, vocab: dict, max_len: int) -> list:
     """
-    Convert target (German) tokens to a right-padded integer ID sequence
-    with <eos> appended before padding.
+    Convert target (German) tokens to an integer ID sequence with <eos>
+    appended, truncated to max_len.  NO padding is added.
+
+    The container adds padding internally when it batches sequences into
+    buckets.  Pre-padding here causes every record to look like an empty
+    sentence because the non-zero payload is drowned out by zeros.
 
     Parameters
     ----------
     tokens  : Word token list from tokenise().
     vocab   : German vocabulary dict {word: token_id}.
-    max_len : Output sequence length (MAX_SEQ_LEN_TARGET).
+    max_len : Hard truncation limit (MAX_SEQ_LEN_TARGET).
 
     Returns
     -------
-    List of exactly max_len integers.
+    List of up to max_len integers ending with EOS_ID (no trailing zeros).
 
     Example
     -------
     tokens = ['die', 'Katze', 'saß', 'auf', 'der', 'Matte']
     → IDs         : [7, 18, 243, 14, 22, 115]
-    → append <eos>: [7, 18, 243, 14, 22, 115, 1]
-    → padded to 50: [7, 18, 243, 14, 22, 115, 1, 0, ..., 0]
+    → append <eos>: [7, 18, 243, 14, 22, 115, 1]   (7 elements, no padding)
     """
-    ids = [vocab.get(tok, UNK_ID) for tok in tokens]
+    ids = [vocab.get(tok, UNK_ID) for tok in tokens[:max_len - 1]]
     ids.append(EOS_ID)
-    ids = ids[:max_len]
-    ids += [PAD_ID] * (max_len - len(ids))
     return ids
 
 
@@ -934,12 +940,13 @@ print(f"    (EOS_ID={EOS_ID} follows the word IDs; remaining positions are PAD_I
 # one sentence pair using two nested layers:
 #
 #   Inner layer — SageMaker protobuf Record
-#       record.features["source_ids"].int32_tensor  ←  English token IDs
-#       record.features["target_ids"].int32_tensor  ←  German  token IDs
+#       record.features["source"].int32_tensor  ←  English token IDs
+#       record.features["target"].int32_tensor  ←  German  token IDs
 #
 #   Outer layer — RecordIO frame (little-endian)
 #       Bytes 0–3 :  0xCED7230A  magic number  (uint32)
-#       Bytes 4–7 :  payload length in bytes   (uint32)
+#       Bytes 4–7 :  (cflag << 29) | payload_length   (uint32)
+#                    cflag = 0 for normal single records
 #       Bytes 8–N :  serialised protobuf bytes
 #       Padding   :  zero bytes to align the next frame to a 4-byte boundary
 # ===========================================================================
@@ -958,8 +965,8 @@ def build_proto_record(source_ids: list, target_ids: list) -> bytes:
     Serialised protobuf bytes ready to be wrapped in a RecordIO frame.
     """
     record = Record()
-    record.features["source_ids"].int32_tensor.values.extend(source_ids)
-    record.features["target_ids"].int32_tensor.values.extend(target_ids)
+    record.features["source"].int32_tensor.values.extend(source_ids)
+    record.features["target"].int32_tensor.values.extend(target_ids)
     return record.SerializeToString()
 
 
@@ -988,30 +995,41 @@ def write_recordio_file(path: str, pairs: list) -> int:
             src_ids = encode_source(en_toks, src_vocab, MAX_SEQ_LEN_SOURCE)
             tgt_ids = encode_target(de_toks, trg_vocab, MAX_SEQ_LEN_TARGET)
 
-            # ── Guard 2: skip all-padding source sequences ────────────────
-            # An all-PAD source (source_len = 0) produces target/source = NaN,
-            # which the container cannot convert to an integer and raises a
-            # fatal "Customer Error: cannot convert float NaN to integer".
-            if all(i == PAD_ID for i in src_ids):
+            # ── Guard 2: skip any pair that still encodes to an empty list ─
+            if not src_ids or not tgt_ids:
                 skipped += 1
                 continue
 
             proto_bytes = build_proto_record(src_ids, tgt_ids)
-            length      = len(proto_bytes)
+            length  = len(proto_bytes)
 
-            # 8-byte frame header: magic number + payload length (little-endian).
-            f.write(struct.pack("<II", RECORDIO_MAGIC, length))
+            # MXNet RecordIO length-word format:
+            #   upper 3 bits  = continuation flag (cflag)
+            #                   0 = single complete record
+            #                   1 = first chunk of a multi-part record
+            #                   2 = middle chunk
+            #                   3 = last chunk
+            #   lower 29 bits = actual payload length
+            # For normal (non-split) records cflag MUST be 0.  The MXNet reader
+            # handles 4-byte-alignment padding automatically — we just need to
+            # write the zero-pad bytes after the payload, not encode them in the
+            # header.  Putting pad_len in the upper bits causes MXNet to
+            # interpret cflag as non-zero, which makes it try to concatenate
+            # multiple frames into one record and corrupts the protobuf payload.
+            pad_len        = (4 - length % 4) % 4
+            encoded_length = length   # cflag=0 for a normal single record
+
+            f.write(struct.pack("<II", RECORDIO_MAGIC, encoded_length))
             f.write(proto_bytes)
 
             # Zero-pad so the next frame starts on a 4-byte boundary.
-            pad_len = (4 - length % 4) % 4
             if pad_len:
                 f.write(b"\x00" * pad_len)
 
             total_bytes += 8 + length + pad_len
 
     if skipped:
-        print(f"  WARNING: Skipped {skipped} empty / all-padding sentence pair(s)")
+        print(f"  WARNING: Skipped {skipped} empty / invalid sentence pair(s)")
     return total_bytes
 
 
@@ -1031,13 +1049,16 @@ print(f"  {VAL_FILE}   : {len(val_tok)} records  ({v_bytes:,} bytes)")
 # Read back the first frame and decode it to verify the round-trip.
 print(f"\n  Verifying frame 0 of {TRAIN_FILE}:")
 with open(TRAIN_FILE, "rb") as f:
-    _, length = struct.unpack("<II", f.read(8))
-    payload   = f.read(length)
+    _, encoded_len = struct.unpack("<II", f.read(8))
+    # MXNet RecordIO stores a continuation flag in the upper 3 bits of the
+    # length word (cflag=0 for normal records).  Mask them out to be safe.
+    actual_len = encoded_len & 0x1FFFFFFF   # lower 29 bits = payload size
+    payload    = f.read(actual_len)
 
 probe = Record()
 probe.ParseFromString(payload)
-src_ids = list(probe.features["source_ids"].int32_tensor.values)
-tgt_ids = list(probe.features["target_ids"].int32_tensor.values)
+src_ids = list(probe.features["source"].int32_tensor.values)
+tgt_ids = list(probe.features["target"].int32_tensor.values)
 
 print(f"    source_ids (first 10) : {src_ids[:10]} ...")
 print(f"    target_ids (first 10) : {tgt_ids[:10]} ...")
@@ -1136,10 +1157,12 @@ def _sns_notify(subject: str, message: str) -> None:
         return
     try:
         sns_client = boto3.client("sns", region_name=REGION)
+        # FIFO SNS topics require MessageGroupId; standard topics ignore it.
         sns_client.publish(
             TopicArn=SNS_TOPIC_ARN,
             Subject=subject,
             Message=message,
+            MessageGroupId="seq2seq-training",
         )
         print(f"  [SNS] Notification sent  →  {SNS_TOPIC_ARN}")
     except Exception as sns_err:          # never let a notification crash the script
@@ -1188,7 +1211,10 @@ def _notify_training_failure(job_name: str, error: Exception) -> None:
 #
 # rnn_attention_type = "mlp"
 #   Multi-layer perceptron (Bahdanau) attention is the standard choice for
-#   natural language translation.
+#   natural language translation.  IMPORTANT: "dot" attention requires the
+#   decoder hidden dimension to match the attention key dimension, but the
+#   bidirectional encoder produces 2×rnn_num_hidden states — causing a shape
+#   mismatch in batch_dot.  "mlp" uses learned projections that handle this.
 #
 # optimized_metric = "bleu"
 #   BLEU (Bilingual Evaluation Understudy) measures n-gram overlap between
@@ -1209,9 +1235,13 @@ print(f"  Container image : {seq2seq_image_uri}")
 
 hyperparameters = {
 
-    # Sequence lengths — must match the encoding step.
+    # Sequence lengths — used for truncation and bucket upper bound.
     "max_seq_len_source": MAX_SEQ_LEN_SOURCE,
     "max_seq_len_target": MAX_SEQ_LEN_TARGET,
+
+    # NOTE: vocabulary sizes are NOT set as hyperparameters.  The Seq2Seq
+    # container reads them directly from the vocab.src.json and vocab.trg.json
+    # files uploaded to the "vocab" S3 channel.
 
     # Token embeddings.
     "num_embed_source": 512,                # encoder token embedding size
@@ -1226,7 +1256,7 @@ hyperparameters = {
     # RNN cell settings.
     "rnn_num_hidden":         512,          # hidden units — must be even (biLSTM)
     "rnn_cell_type":          "lstm",       # lstm or gru
-    "rnn_attention_type":     "dot",        # dot | fixed | mlp | bilinear
+    "rnn_attention_type":     "mlp",        # mlp (Bahdanau) handles bidir dim mismatch
     "rnn_decoder_state_init": "last",       # seed decoder with encoder's final state
 
     # Optimiser.
