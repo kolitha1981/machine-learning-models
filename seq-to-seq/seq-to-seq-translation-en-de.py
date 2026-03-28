@@ -1171,7 +1171,7 @@ def _sns_notify(subject: str, message: str) -> None:
 
 def _notify_training_success(job_name: str, model_artefact: str) -> None:
     """Send a success notification after a completed training job."""
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     _sns_notify(
         subject=f"[SUCCESS] SageMaker training job completed — {job_name}",
         message=(
@@ -1185,7 +1185,7 @@ def _notify_training_success(job_name: str, model_artefact: str) -> None:
 
 def _notify_training_failure(job_name: str, error: Exception) -> None:
     """Send a failure notification when a training job raises an exception."""
-    ts = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    ts = datetime.datetime.now(datetime.UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
     _sns_notify(
         subject=f"[FAILED] SageMaker training job failed — {job_name}",
         message=(
