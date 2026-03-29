@@ -22,10 +22,11 @@ Each file maps word strings to integer token IDs:
 
     {
       "<pad>": 0,
-      "<eos>": 1,
-      "<unk>": 2,
-      "the":   3,
-      "a":     4,
+      "<unk>": 1,
+      "<s>":   2,
+      "</s>":  3,
+      "the":   4,
+      "a":     5,
       ...
     }
 
@@ -37,14 +38,14 @@ RecordIO protobuf record layout
 Each record encodes one sentence pair:
 
     English  "the cat sat on the mat"
-             → tokenise → [3, 12, 87, 9, 3, 63]
-             → pad to max_seq_len_source (e.g. 50)
+             → tokenise → [4, 13, 88, 10, 4, 64]
+             → pad to max_seq_len_source (e.g. 15)
              stored in  record.features["source"].int32_tensor
 
     German   "die Katze saß auf der Matte"
-             → tokenise → [7, 18, 243, 14, 22, 115]
-             → append <eos> (ID 1) → [7, 18, 243, 14, 22, 115, 1]
-             → pad to max_seq_len_target (e.g. 50)
+             → tokenise → [8, 19, 244, 15, 23, 116]
+             → append </s> (ID 3) → [8, 19, 244, 15, 23, 116, 3]
+             → pad to max_seq_len_target (e.g. 20)
              stored in  record.features["target"].int32_tensor
 """
 
@@ -79,7 +80,7 @@ except ImportError:
 S3_BUCKET = "seq2seq-translation"
 S3_PREFIX = "seq2seq-en-de"
 REGION    = "us-east-2"
-ROLE_ARN  = "arn:aws:iam::148469447057:role/service-role/AmazonSageMaker-ExecutionRole-20260328T104911"
+ROLE_ARN  = "arn:aws:iam::148469447057:role/service-role/AmazonSageMaker-ExecutionRole-20260329T112191"
 # GPU instance is required for training.
 TRAINING_INSTANCE_TYPE  = "ml.g5.2xlarge"
 INFERENCE_INSTANCE_TYPE = "ml.g5.2xlarge"
@@ -94,18 +95,26 @@ SNS_TOPIC_ARN           = "arn:aws:sns:us-east-2:148469447057:seq2seq-training-n
 # SEQUENCE AND VOCABULARY PARAMETERS
 # ===========================================================================
 # Sentences longer than these limits are truncated; shorter ones are padded.
-MAX_SEQ_LEN_SOURCE = 50   # maximum English tokens per sentence
-MAX_SEQ_LEN_TARGET = 50   # maximum German  tokens per sentence
+# These should be close to the actual maximum token lengths in your corpus
+# (with a small buffer).  Setting them much larger than the data wastes
+# bucket slots and causes a Sockeye warning at checkpoint-BLEU time:
+#   "Model was only trained with sentences up to a length of N,
+#    but a max_input_len of M is used."
+# Current corpus: max source ≈ 10 tokens, max target ≈ 12 tokens.
+MAX_SEQ_LEN_SOURCE = 15   # maximum English tokens per sentence
+MAX_SEQ_LEN_TARGET = 20   # maximum German  tokens per sentence
 # Only the top MAX_VOCAB_SIZE most-frequent words are kept in each vocabulary.
 # Words outside this limit are replaced with the <unk> token at encode time.
 MAX_VOCAB_SIZE = 30_000   # 30 k is a common choice for MT tasks
 # ---------------------------------------------------------------------------
 # Special token IDs — must be consistent across both vocab files and all .rec
+# The SageMaker Seq2Seq container (Sockeye) expects exactly these four tokens.
 # ---------------------------------------------------------------------------
 PAD_ID      = 0   # <pad>  padding for sequences shorter than the maximum
-EOS_ID      = 1   # <eos>  end-of-sequence, appended to every target sentence
-UNK_ID      = 2   # <unk>  replaces words that are absent from the vocabulary
-WORD_OFFSET = 3   # real word IDs begin at 3 (0–2 are reserved for specials)
+UNK_ID      = 1   # <unk>  replaces words that are absent from the vocabulary
+BOS_ID      = 2   # <s>   beginning-of-sentence, used by the decoder at inference
+EOS_ID      = 3   # </s>  end-of-sequence, appended to every target sentence
+WORD_OFFSET = 4   # real word IDs begin at 4 (0–3 are reserved for specials)
 
 
 # ===========================================================================
@@ -758,13 +767,13 @@ def build_vocab(token_lists: list, max_size: int) -> dict:
     Parameters
     ----------
     token_lists : List of tokenised sentences (each a list of str).
-    max_size    : Maximum vocabulary size including the three special tokens.
+    max_size    : Maximum vocabulary size including the four special tokens.
                   Words beyond this limit are handled with <unk> at encode time.
 
     Returns
     -------
     vocab : dict  {word_string: integer_token_id}
-            e.g.  {"<pad>": 0, "<eos>": 1, "<unk>": 2, "the": 3, "a": 4, ...}
+            e.g.  {"<pad>": 0, "<unk>": 1, "<s>": 2, "</s>": 3, "the": 4, ...}
     """
     # Count word frequencies across all sentences.
     counter = collections.Counter()
@@ -772,18 +781,19 @@ def build_vocab(token_lists: list, max_size: int) -> dict:
         counter.update(tokens)
 
     # Keep only the (max_size - WORD_OFFSET) most frequent words so there is
-    # room for the three special tokens at IDs 0, 1, and 2.
+    # room for the four special tokens at IDs 0, 1, 2, and 3.
     top_words = [word for word, _ in counter.most_common(max_size - WORD_OFFSET)]
 
     # Assign integer IDs — special tokens first, then real words in
-    # descending frequency order starting at WORD_OFFSET (= 3).
+    # descending frequency order starting at WORD_OFFSET (= 4).
     vocab = {
         "<pad>": PAD_ID,   # 0
-        "<eos>": EOS_ID,   # 1
-        "<unk>": UNK_ID,   # 2
+        "<unk>": UNK_ID,   # 1
+        "<s>":   BOS_ID,   # 2
+        "</s>":  EOS_ID,   # 3
     }
     for rank, word in enumerate(top_words):
-        vocab[word] = rank + WORD_OFFSET   # 3, 4, 5, …
+        vocab[word] = rank + WORD_OFFSET   # 4, 5, 6, …
 
     return vocab
 
@@ -825,11 +835,12 @@ print(f"""
   ───────────────────────────────────────────────
   {{
     "<pad>": 0,    ← padding token
-    "<eos>": 1,    ← end-of-sequence
-    "<unk>": 2,    ← unknown / out-of-vocabulary
-    "the":   3,    ← most frequent word
-    "a":     4,
-    "is":    5,
+    "<unk>": 1,    ← unknown / out-of-vocabulary
+    "<s>":   2,    ← beginning-of-sentence (BOS)
+    "</s>":  3,    ← end-of-sentence (EOS)
+    "the":   4,    ← most frequent word
+    "a":     5,
+    "is":    6,
     ...
   }}
 """)
@@ -853,7 +864,7 @@ print(f"""
 # Target encoding (German)
 #   1. Look up each word in trg_vocab; use UNK_ID for unknown words.
 #   2. Truncate to MAX_SEQ_LEN_TARGET - 1 if longer.
-#   3. Append EOS_ID (1) to mark the end of the sentence.
+#   3. Append EOS_ID (3) to mark the end of the sentence.
 # ===========================================================================
 
 def encode_source(tokens: list, vocab: dict, max_len: int) -> list:
@@ -887,7 +898,7 @@ def encode_source(tokens: list, vocab: dict, max_len: int) -> list:
 
 def encode_target(tokens: list, vocab: dict, max_len: int) -> list:
     """
-    Convert target (German) tokens to an integer ID sequence with <eos>
+    Convert target (German) tokens to an integer ID sequence with </s>
     appended, truncated to max_len.  NO padding is added.
 
     The container adds padding internally when it batches sequences into
@@ -907,8 +918,8 @@ def encode_target(tokens: list, vocab: dict, max_len: int) -> list:
     Example
     -------
     tokens = ['die', 'Katze', 'saß', 'auf', 'der', 'Matte']
-    → IDs         : [7, 18, 243, 14, 22, 115]
-    → append <eos>: [7, 18, 243, 14, 22, 115, 1]   (7 elements, no padding)
+    → IDs         : [8, 19, 244, 15, 23, 116]
+    → append </s> : [8, 19, 244, 15, 23, 116, 3]   (7 elements, no padding)
     """
     ids = [vocab.get(tok, UNK_ID) for tok in tokens[:max_len - 1]]
     ids.append(EOS_ID)
@@ -1156,13 +1167,17 @@ def _sns_notify(subject: str, message: str) -> None:
     if not SNS_TOPIC_ARN:
         return
     try:
+        import uuid
         sns_client = boto3.client("sns", region_name=REGION)
-        # FIFO SNS topics require MessageGroupId; standard topics ignore it.
+        # FIFO SNS topics require both MessageGroupId and
+        # MessageDeduplicationId (unless ContentBasedDeduplication is
+        # enabled on the topic).  Standard topics ignore these fields.
         sns_client.publish(
             TopicArn=SNS_TOPIC_ARN,
             Subject=subject,
             Message=message,
             MessageGroupId="seq2seq-training",
+            MessageDeduplicationId=str(uuid.uuid4()),
         )
         print(f"  [SNS] Notification sent  →  {SNS_TOPIC_ARN}")
     except Exception as sns_err:          # never let a notification crash the script
@@ -1343,14 +1358,26 @@ except Exception as _training_exc:
 # ===========================================================================
 # STEP 7 — DEPLOY ENDPOINT AND RUN INFERENCE
 # ===========================================================================
-# Request format sent to the endpoint:
-#   {"instances": [{"source": [word_id_1, word_id_2, ..., word_id_50]}]}
+# The SageMaker built-in Seq2Seq container uses the standard SageMaker
+# protobuf-style JSON layout for inference.
 #
-# Response format returned by the endpoint:
-#   {"predictions": [{"score": [...], "target": [word_id_1, ..., word_id_50]}]}
+# Request format (application/json):
+#   {
+#     "instances": [
+#       {"data": {"features": {"values": [1.0, 2.0, ..., 0.0]}}}
+#     ]
+#   }
+#   • Token IDs must be floats (the container reads a float32 tensor).
+#   • The array must be padded to exactly max_seq_len_source with PAD_ID (0).
 #
-# Predicted token IDs are decoded back to German words using id_to_trg.
-# PAD_ID (0) and EOS_ID (1) are stripped before displaying the result.
+# Response format:
+#   {
+#     "predictions": [
+#       {"target": [4.0, 5.0, ..., 0.0], "score": -1.234}
+#     ]
+#   }
+#   • Predicted IDs are floats — cast to int for vocab lookup.
+#   • PAD_ID (0) and EOS_ID (3) are stripped before displaying the result.
 # ===========================================================================
 print("\n" + "=" * 70)
 print("STEP 7 — Deploying endpoint and running inference")
@@ -1370,15 +1397,32 @@ demo_en_tokens, demo_de_tokens = val_tok[0]
 demo_src_ids    = encode_source(demo_en_tokens, src_vocab, MAX_SEQ_LEN_SOURCE)
 demo_tgt_ids_gt = encode_target(demo_de_tokens, trg_vocab, MAX_SEQ_LEN_TARGET)
 
-print(f"\n  Input  (English)      : {demo_en_tokens}")
-print(f"  Source IDs (first 10) : {demo_src_ids[:10]} ...")
+# Pad source IDs to exactly MAX_SEQ_LEN_SOURCE.  The inference endpoint
+# expects a fixed-length tensor (unlike training, which uses bucketing).
+demo_src_ids_padded = demo_src_ids + [PAD_ID] * (MAX_SEQ_LEN_SOURCE - len(demo_src_ids))
 
-response = predictor.predict(
-    {"instances": [{"source": demo_src_ids}]}
-)
+print(f"\n  Input  (English)      : {demo_en_tokens}")
+print(f"  Source IDs (first 10) : {demo_src_ids_padded[:10]} ...")
+
+# Build the payload in the format the Seq2Seq container expects.
+# Token IDs must be sent as floats inside data.features.values.
+payload = {
+    "instances": [
+        {
+            "data": {
+                "features": {
+                    "values": [float(i) for i in demo_src_ids_padded]
+                }
+            }
+        }
+    ]
+}
+
+response = predictor.predict(payload)
 
 # Decode predicted token IDs → German words, stripping PAD and EOS.
-predicted_ids   = response["predictions"][0]["target"]
+# The endpoint returns float IDs; cast them to int for vocab lookup.
+predicted_ids   = [int(i) for i in response["predictions"][0]["target"]]
 predicted_words = [
     id_to_trg.get(i, "<unk>")
     for i in predicted_ids
