@@ -1364,19 +1364,23 @@ except Exception as _training_exc:
 # Request format (application/json):
 #   {
 #     "instances": [
-#       {"data": {"features": {"values": [1.0, 2.0, ..., 0.0]}}}
+#       {"data": {"features": {"values": [5, 20, 991, 0, 0, ...]}}}
 #     ]
 #   }
-#   • Token IDs must be floats (the container reads a float32 tensor).
+#   • Token IDs are integers — matching the int32_tensor format used in
+#     the RecordIO training data and by the BLEU checkpoint decoder.
+#     Sending floats (5.0 instead of 5) can cause the container to create
+#     a float32_tensor instead of int32_tensor, which the Translator
+#     rejects with a 400 "unable to evaluate payload provided" error.
 #   • The array must be padded to exactly max_seq_len_source with PAD_ID (0).
 #
 # Response format:
 #   {
 #     "predictions": [
-#       {"target": [4.0, 5.0, ..., 0.0], "score": -1.234}
+#       {"target": [4, 5, ..., 0], "score": -1.234}
 #     ]
 #   }
-#   • Predicted IDs are floats — cast to int for vocab lookup.
+#   • Predicted IDs may be returned as floats — cast to int for vocab lookup.
 #   • PAD_ID (0) and EOS_ID (3) are stripped before displaying the result.
 # ===========================================================================
 print("\n" + "=" * 70)
@@ -1405,13 +1409,14 @@ print(f"\n  Input  (English)      : {demo_en_tokens}")
 print(f"  Source IDs (first 10) : {demo_src_ids_padded[:10]} ...")
 
 # Build the payload in the format the Seq2Seq container expects.
-# Token IDs must be sent as floats inside data.features.values.
+# Token IDs are sent as integers inside data.features.values, matching
+# the int32_tensor format used during training and BLEU evaluation.
 payload = {
     "instances": [
         {
             "data": {
                 "features": {
-                    "values": [float(i) for i in demo_src_ids_padded]
+                    "values": demo_src_ids_padded
                 }
             }
         }
@@ -1421,7 +1426,7 @@ payload = {
 response = predictor.predict(payload)
 
 # Decode predicted token IDs → German words, stripping PAD and EOS.
-# The endpoint returns float IDs; cast them to int for vocab lookup.
+# The endpoint may return IDs as floats; cast to int for vocab lookup.
 predicted_ids   = [int(i) for i in response["predictions"][0]["target"]]
 predicted_words = [
     id_to_trg.get(i, "<unk>")
